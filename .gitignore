@@ -1,5 +1,9 @@
 data/
 grok-ui/
 node_modules/
-server-go/darkroom.exe
+
+# Go 构建产物（go build -o darkroom.exe 覆盖旧文件时会留下 ~ 备份）
 server-go/darkroom
+server-go/darkroom.exe
+server-go/darkroom.exe~
+server-go/*.exe
