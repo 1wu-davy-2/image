@@ -43,18 +43,19 @@ node server.js          # 或者 npm start
 
 然后打开 http://127.0.0.1:3780 。
 
-首次启动会随机生成一个管理密码，打印在控制台，同时写进 `data/initial-admin-password.txt`
-（在管理端改过密码后这个文件会自动删掉）。想自己指定就用 `ADMIN_PASSWORD` 环境变量：
+管理端默认账号是 **`admin` / `admin@123`**，服务只监听 `127.0.0.1`，不对外网开放。
+登录后请到管理端把密码改掉。
+
+想换账号密码就用环境变量，设了 `ADMIN_PASSWORD` 之后每次启动都会把管理端对齐到这个密码，
+忘了密码时也能用它找回来：
 
 ```bash
-PORT=3780 ADMIN_PASSWORD=your-password node server.js
+PORT=3780 ADMIN_USER=admin ADMIN_PASSWORD=your-password node server.js
 ```
-
-服务只监听 `127.0.0.1`，不对外网开放。
 
 ## 上手顺序
 
-1. 打开 http://127.0.0.1:3780/admin ，用初始密码进入管理端。
+1. 打开 http://127.0.0.1:3780/admin ，用 `admin` / `admin@123` 进入管理端。
 2. 在「生图 Key」里加一把 Key：选类型，填中转地址和 API Key。GPT / 香蕉 / 批量填
    `https://uuapi.io/v1`，官方直连填 `https://uuapi.io`。保存后点「刷新余额」，确认能查到余额。
 3. 回到 http://127.0.0.1:3780 ，注册一个账号，点「签到领额度」。
@@ -102,7 +103,8 @@ PORT=3780 ADMIN_PASSWORD=your-password node server.js
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `3780` | 监听端口 |
-| `ADMIN_PASSWORD` | 随机生成 | 管理端密码；设了之后每次启动都会对齐成这个值 |
+| `ADMIN_USER` | `admin` | 管理端账号 |
+| `ADMIN_PASSWORD` | `admin@123` | 管理端密码；设了之后每次启动都会对齐成这个值 |
 
 ## HTTP 接口
 

@@ -6,6 +6,8 @@ const DATA_DIR = path.join(__dirname, "data");
 const STORE_PATH = path.join(DATA_DIR, "store.json");
 const PASSWORD_NOTE = path.join(DATA_DIR, "initial-admin-password.txt");
 const SESSION_MS = 14 * 24 * 60 * 60 * 1000;
+const DEFAULT_ADMIN_USER = "admin";
+const DEFAULT_ADMIN_PASSWORD = "admin@123";
 
 class StoreError extends Error {
   constructor(status, message) {
@@ -135,25 +137,40 @@ function createSession(data, role, userId) {
 }
 
 function ensureAdmin() {
+  const envUser = String(process.env.ADMIN_USER || "").trim();
   const envPassword = String(process.env.ADMIN_PASSWORD || "");
+  const username = envUser || DEFAULT_ADMIN_USER;
   const data = load();
+
+  // An explicit ADMIN_PASSWORD wins every boot, so a forgotten password is
+  // recoverable by restarting with the variable set.
   if (envPassword) {
     if (envPassword.length < 6) throw new Error("ADMIN_PASSWORD 至少 6 位");
-    if (!data.admin || !verifyPassword(envPassword, data.admin.salt, data.admin.hash)) {
-      data.admin = hashPassword(envPassword);
+    const unchanged = data.admin
+      && data.admin.username === username
+      && verifyPassword(envPassword, data.admin.salt, data.admin.hash);
+    if (!unchanged) {
+      data.admin = { username, ...hashPassword(envPassword) };
       save(data);
-      console.log("管理端密码已按环境变量 ADMIN_PASSWORD 设置");
+      fs.rmSync(PASSWORD_NOTE, { force: true });
+      console.log(`管理端账号已按环境变量对齐：${username}`);
     }
     return;
   }
-  if (data.admin) return;
-  const password = crypto.randomBytes(9).toString("base64url");
-  data.admin = hashPassword(password);
+
+  if (data.admin) {
+    // Stores written before the username existed have no account name.
+    if (!data.admin.username) {
+      data.admin.username = username;
+      save(data);
+    }
+    return;
+  }
+
+  data.admin = { username, ...hashPassword(DEFAULT_ADMIN_PASSWORD) };
   save(data);
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(PASSWORD_NOTE, `管理端初始密码：${password}\n登录 http://127.0.0.1:3780/admin 后请修改密码，并删除本文件。\n`);
-  console.log(`管理端初始密码：${password}`);
-  console.log(`已写入 ${PASSWORD_NOTE}`);
+  console.log(`管理端默认账号：${username} / ${DEFAULT_ADMIN_PASSWORD}`);
+  console.log("服务只监听 127.0.0.1。登录后请到管理端把密码改掉。");
 }
 
 function validateUsername(username) {
@@ -201,10 +218,17 @@ function login(username, password) {
   });
 }
 
-function loginAdmin(password) {
+function loginAdmin(username, password) {
+  const name = String(username || "").trim();
   const secret = String(password || "");
   return update((data) => {
-    if (!data.admin || !verifyPassword(secret, data.admin.salt, data.admin.hash)) throw new StoreError(401, "管理密码不对");
+    if (!data.admin) throw new StoreError(401, "管理端还没初始化，重启一次服务");
+    const expected = data.admin.username || DEFAULT_ADMIN_USER;
+    // Both halves are checked on every attempt so a wrong account name and a
+    // wrong password cost the same.
+    const nameOk = name.toLowerCase() === expected.toLowerCase();
+    const passwordOk = verifyPassword(secret, data.admin.salt, data.admin.hash);
+    if (!nameOk || !passwordOk) throw new StoreError(401, "管理账号或密码不对");
     return { token: createSession(data, "admin", "") };
   });
 }

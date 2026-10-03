@@ -253,7 +253,10 @@ document.querySelector("#loginView").addEventListener("submit", async (event) =>
   try {
     await api("/api/admin/login", {
       method: "POST",
-      body: JSON.stringify({ password: document.querySelector("#adminPassword").value }),
+      body: JSON.stringify({
+        username: document.querySelector("#adminUser").value.trim(),
+        password: document.querySelector("#adminPassword").value,
+      }),
     });
     document.querySelector("#adminPassword").value = "";
     await loadState();

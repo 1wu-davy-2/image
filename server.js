@@ -984,7 +984,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/api/admin/login") {
       const body = await readJson(req);
-      const result = await store.loginAdmin(body.password);
+      const result = await store.loginAdmin(body.username, body.password);
       sendJson(res, 200, { ok: true }, sessionCookie("darkroom_admin", result.token));
       return;
     }
