@@ -82,6 +82,7 @@
                   <option value="gpt">GPT 生图</option>
                   <option value="nano">Nano Banana 香蕉生图</option>
                   <option value="gemini-official">GEMINI官方直连-带生图</option>
+                  <option value="gemini-batch">Gemini 批量生图</option>
                 </select>
               </div>
             </div>
@@ -94,6 +95,13 @@
             </div>
             <label for="keySecret">API Key</label>
             <input id="keySecret" type="password" autocomplete="off" spellcheck="false" placeholder="新建时必填，编辑时留空表示不改" />
+            <label for="keyAgent">请求头 User-Agent</label>
+            <input id="keyAgent" maxlength="200" spellcheck="false" placeholder="留空则用 darkroom/1.0 (local image studio)" />
+            <div class="presets">
+              <button type="button" data-agent="claude-cli/2.0.76 (external, cli)">Claude CLI</button>
+              <button type="button" data-agent="codex_cli_rs/0.77.0 (Windows 10.0.26100; x86_64) WindowsTerminal">Codex CLI</button>
+              <button type="button" data-agent="">用默认</button>
+            </div>
             <div class="split">
               <div>
                 <label for="keyBalance">剩余余额</label>
@@ -128,7 +136,7 @@
         </section>
 
         <section class="panel">
-          <h2>用户额度</h2>
+          <h2>用户</h2>
           <div class="table-wrap">
             <table>
               <thead>
@@ -136,7 +144,8 @@
                   <th>用户</th>
                   <th>额度</th>
                   <th>上次签到</th>
-                  <th>调整</th>
+                  <th>状态</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody id="userRows"></tbody>

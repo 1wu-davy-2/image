@@ -96,6 +96,7 @@ function publicUser(user) {
     id: user.id,
     username: user.username,
     quota: user.quota,
+    disabled: Boolean(user.disabled),
     lastCheckinDate: user.lastCheckinDate || "",
     checkedInToday: user.lastCheckinDate === today,
     createdAt: user.createdAt,
@@ -109,14 +110,22 @@ function publicKey(key) {
     protocol: key.protocol,
     baseUrl: key.baseUrl,
     apiKey: key.apiKey,
+    userAgent: key.userAgent || "",
     balance: key.balance,
     balanceUnit: key.balanceUnit || "USD",
+    balanceValid: typeof key.balanceValid === "boolean" ? key.balanceValid : null,
     balanceUpdatedAt: key.balanceUpdatedAt || "",
     balanceError: key.balanceError || "",
     enabled: key.enabled !== false,
     note: key.note || "",
     lastUsedAt: key.lastUsedAt || 0,
   };
+}
+
+function findUser(data, id) {
+  const user = data.users.find((item) => item.id === id);
+  if (!user) throw new StoreError(404, "找不到这个用户");
+  return user;
 }
 
 function createSession(data, role, userId) {
@@ -171,6 +180,7 @@ function register(username, password) {
       username: name,
       ...hashPassword(secret),
       quota: 0,
+      disabled: false,
       lastCheckinDate: "",
       createdAt: new Date().toISOString(),
     };
@@ -186,6 +196,7 @@ function login(username, password) {
   return update((data) => {
     const user = data.users.find((item) => item.username.toLowerCase() === name.toLowerCase());
     if (!user || !verifyPassword(secret, user.salt, user.hash)) throw new StoreError(401, "用户名或密码不对");
+    if (user.disabled) throw new StoreError(403, "这个账号已被停用");
     return { token: createSession(data, "user", user.id), user: publicUser(user) };
   });
 }
@@ -210,7 +221,7 @@ async function sessionUser(token) {
   const session = data.sessions.find((item) => item.token === token && item.role === "user" && item.expiresAt > Date.now());
   if (!session) return null;
   const user = data.users.find((item) => item.id === session.userId);
-  return user ? publicUser(user) : null;
+  return user && !user.disabled ? publicUser(user) : null;
 }
 
 async function sessionAdmin(token) {
@@ -247,7 +258,11 @@ function checkin(userId) {
 }
 
 function pickKey(data, protocol) {
-  const list = data.keys.filter((key) => key.enabled !== false && key.protocol === protocol && key.apiKey);
+  // balanceValid === false means /v1/usage reported is_active false: the relay
+  // has already rejected this credential, so stop handing it work.
+  const list = data.keys.filter(
+    (key) => key.enabled !== false && key.protocol === protocol && key.apiKey && key.balanceValid !== false,
+  );
   const known = list
     .filter((key) => typeof key.balance === "number" && key.balance > 0)
     .sort((a, b) => b.balance - a.balance || (a.lastUsedAt || 0) - (b.lastUsedAt || 0));
@@ -257,17 +272,30 @@ function pickKey(data, protocol) {
   return known[0] || unknown[0] || null;
 }
 
-function reserveGeneration(userId, protocol) {
+function requireKeyFor(data, protocol) {
+  const key = pickKey(data, protocol);
+  if (!key) throw new StoreError(400, "没有可用的生图 Key。请在管理端添加，或确认剩余余额大于 0。");
+  return key;
+}
+
+// Read-only counterpart of reserveGeneration: batch polling and downloads still
+// need a Key, but they must not spend the user's quota.
+function keyFor(protocol) {
+  return view().then((data) => publicKey(requireKeyFor(data, protocol)));
+}
+
+function reserveGeneration(userId, protocol, units = 1) {
+  const count = Math.max(1, Math.floor(Number(units) || 1));
   return update((data) => {
     const user = data.users.find((item) => item.id === userId);
     if (!user) throw new StoreError(401, "请先登录");
-    const cost = Number(data.settings.generateCost) || 0;
+    if (user.disabled) throw new StoreError(403, "这个账号已被停用");
+    const cost = (Number(data.settings.generateCost) || 0) * count;
     if (user.quota < cost) {
       const hint = user.lastCheckinDate === todayShanghai() ? "额度不足，明天可以再签到。" : "额度不足，可以先签到领取。";
       throw new StoreError(402, hint);
     }
-    const key = pickKey(data, protocol);
-    if (!key) throw new StoreError(400, "没有可用的生图 Key。请在管理端添加，或确认剩余余额大于 0。");
+    const key = requireKeyFor(data, protocol);
     user.quota -= cost;
     key.lastUsedAt = Date.now();
     return { cost, quota: user.quota, key: publicKey(key) };
@@ -317,20 +345,28 @@ function saveKey(input) {
         createdAt: new Date().toISOString(),
         balance: null,
         balanceUnit: "USD",
+        balanceValid: null,
         balanceUpdatedAt: "",
         balanceError: "",
         lastUsedAt: 0,
       };
       data.keys.push(key);
     }
+    // A cached balance belongs to the credential it was read with.
+    const credentialsChanged = (Boolean(input.apiKey) && input.apiKey !== key.apiKey) || (Boolean(input.baseUrl) && input.baseUrl !== key.baseUrl);
     key.name = String(input.name || "").trim();
     if (!key.name || key.name.length > 40) throw new StoreError(400, "请填写 40 字以内的名称");
     key.protocol = input.protocol;
     key.baseUrl = input.baseUrl;
     if (input.apiKey) key.apiKey = input.apiKey;
     if (!key.apiKey) throw new StoreError(400, "请填写 API Key");
+    key.userAgent = String(input.userAgent || "").trim().slice(0, 200);
     key.balance = input.balance;
     key.balanceUnit = input.balanceUnit || key.balanceUnit || "USD";
+    if (credentialsChanged) {
+      key.balanceValid = null;
+      key.balanceError = "";
+    }
     key.enabled = input.enabled !== false;
     key.note = String(input.note || "").trim().slice(0, 200);
     return publicKey(key);
@@ -352,6 +388,7 @@ function setKeyBalance(id, fresh, error) {
     if (fresh) {
       key.balance = fresh.balance;
       key.balanceUnit = fresh.unit || "USD";
+      key.balanceValid = typeof fresh.valid === "boolean" ? fresh.valid : null;
       key.balanceUpdatedAt = new Date().toISOString();
       key.balanceError = "";
     } else if (error) {
@@ -364,10 +401,47 @@ function setKeyBalance(id, fresh, error) {
 function setUserQuota(id, quota) {
   return update((data) => {
     if (!Number.isInteger(quota) || quota < 0 || quota > 1000000) throw new StoreError(400, "额度需要是 0 到 1000000 的整数");
-    const user = data.users.find((item) => item.id === id);
-    if (!user) throw new StoreError(404, "找不到这个用户");
+    const user = findUser(data, id);
     user.quota = quota;
     return publicUser(user);
+  });
+}
+
+function setUserDisabled(id, disabled) {
+  return update((data) => {
+    const user = findUser(data, id);
+    user.disabled = Boolean(disabled);
+    if (user.disabled) data.sessions = data.sessions.filter((session) => session.userId !== id);
+    return publicUser(user);
+  });
+}
+
+function changeUserPassword(userId, oldPassword, newPassword) {
+  const next = validatePassword(newPassword);
+  return update((data) => {
+    const user = findUser(data, userId);
+    if (!verifyPassword(String(oldPassword || ""), user.salt, user.hash)) throw new StoreError(401, "原密码不对");
+    Object.assign(user, hashPassword(next));
+    return publicUser(user);
+  });
+}
+
+function resetUserPassword(id, newPassword) {
+  const next = validatePassword(newPassword);
+  return update((data) => {
+    const user = findUser(data, id);
+    Object.assign(user, hashPassword(next));
+    data.sessions = data.sessions.filter((session) => session.userId !== id);
+    return publicUser(user);
+  });
+}
+
+function deleteUser(id) {
+  return update((data) => {
+    const before = data.users.length;
+    data.users = data.users.filter((user) => user.id !== id);
+    if (data.users.length === before) throw new StoreError(404, "找不到这个用户");
+    data.sessions = data.sessions.filter((session) => session.userId !== id);
   });
 }
 
@@ -384,6 +458,7 @@ module.exports = {
   sessionAdmin,
   changeAdminPassword,
   checkin,
+  keyFor,
   reserveGeneration,
   refund,
   adminState,
@@ -392,4 +467,8 @@ module.exports = {
   deleteKey,
   setKeyBalance,
   setUserQuota,
+  setUserDisabled,
+  changeUserPassword,
+  resetUserPassword,
+  deleteUser,
 };

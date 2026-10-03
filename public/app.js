@@ -52,6 +52,17 @@ const imageSize = document.querySelector("#imageSize");
 const editFields = document.querySelector("#editFields");
 const imageFile = document.querySelector("#imageFile");
 const imageUrl = document.querySelector("#imageUrl");
+const maskFile = document.querySelector("#maskFile");
+const maskUrl = document.querySelector("#maskUrl");
+const passwordBox = document.querySelector("#passwordBox");
+const batchModel = document.querySelector("#batchModel");
+const batchPrompts = document.querySelector("#batchPrompts");
+const batchSize = document.querySelector("#batchSize");
+const batchProvider = document.querySelector("#batchProvider");
+const batchSubmit = document.querySelector("#batchSubmit");
+const batchRefresh = document.querySelector("#batchRefresh");
+const batchStatus = document.querySelector("#batchStatus");
+const batchList = document.querySelector("#batchList");
 const submit = document.querySelector("#submit");
 const status = document.querySelector("#status");
 const canvas = document.querySelector("#canvas");
@@ -66,6 +77,7 @@ let tick = 0;
 let me = null;
 let checkinQuota = 5;
 let generateCost = 1;
+let batchBusy = false;
 
 function loadPrefs() {
   try {
@@ -173,6 +185,7 @@ async function refreshMe() {
   checkinQuota = data.checkinQuota;
   generateCost = data.generateCost;
   renderAuth();
+  loadBatches({ quiet: true });
 }
 
 async function auth(path) {
@@ -323,6 +336,8 @@ async function onSubmit(event) {
       if (imageFile.files[0]) payload.image = await readFile(imageFile.files[0]);
       else if (imageUrl.value.trim()) payload.imageUrl = imageUrl.value.trim();
       else throw new Error("图生图需要参考图或图片 URL。");
+      if (maskFile.files[0]) payload.mask = await readFile(maskFile.files[0]);
+      else if (maskUrl.value.trim()) payload.maskUrl = maskUrl.value.trim();
     }
     const response = await fetch("/api/generate", {
       method: "POST",
@@ -372,7 +387,31 @@ document.querySelector("#logoutBtn").addEventListener("click", async () => {
   await fetch("/api/auth/logout", { method: "POST" });
   me = { user: null, checkinQuota, generateCost };
   renderAuth();
+  loadBatches({ quiet: true });
   setStatus("已退出。");
+});
+document.querySelector("#passwordToggle").addEventListener("click", () => {
+  passwordBox.classList.toggle("hidden");
+});
+document.querySelector("#changePasswordBtn").addEventListener("click", async () => {
+  try {
+    const response = await fetch("/api/me/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        oldPassword: document.querySelector("#oldPassword").value,
+        newPassword: document.querySelector("#newPassword").value,
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || "改密码失败");
+    document.querySelector("#oldPassword").value = "";
+    document.querySelector("#newPassword").value = "";
+    passwordBox.classList.add("hidden");
+    setStatus("密码已修改。");
+  } catch (error) {
+    setStatus(error.message, true);
+  }
 });
 checkinBtn.addEventListener("click", async () => {
   checkinBtn.disabled = true;
@@ -397,6 +436,165 @@ form.addEventListener("submit", onSubmit);
 prompt.addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") form.requestSubmit();
 });
+
+function setBatchStatus(message, isError) {
+  batchStatus.textContent = message || "";
+  batchStatus.classList.toggle("error", Boolean(isError));
+}
+
+function batchButton(label, handler) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.addEventListener("click", handler);
+  return button;
+}
+
+// The relay's list shape is not fixed, so accept the wrappers it is likely to use.
+function batchEntries(result) {
+  if (Array.isArray(result)) return result;
+  for (const key of ["data", "batches", "items"]) {
+    if (result && Array.isArray(result[key])) return result[key];
+  }
+  return [];
+}
+
+function batchSummary(batch) {
+  const status = String(batch?.status || "");
+  const counts = batch?.item_count ?? batch?.request_counts?.total ?? batch?.outputs;
+  return [status, counts === undefined ? "" : `${counts} 条`].filter(Boolean).join(" · ") || "未知状态";
+}
+
+function renderBatches(result) {
+  batchList.replaceChildren();
+  const list = batchEntries(result);
+  if (!list.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "还没有批量任务。";
+    batchList.append(empty);
+    return;
+  }
+  list.slice(0, 12).forEach((batch) => {
+    const id = String(batch?.id || batch?.batch_id || "");
+    const row = document.createElement("div");
+    row.className = "batch-row";
+    const label = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = id || "（上游没给编号）";
+    const meta = document.createElement("small");
+    meta.textContent = batchSummary(batch);
+    label.append(title, meta);
+    const actions = document.createElement("div");
+    actions.className = "row-actions";
+    if (id) {
+      actions.append(
+        batchButton("刷新", () => refreshBatch(id)),
+        batchButton("下载", () => {
+          window.location.href = `/api/batches/${encodeURIComponent(id)}/download`;
+        }),
+        batchButton("取消", () => cancelBatch(id)),
+        batchButton("删除", () => deleteBatch(id)),
+      );
+    }
+    row.append(label, actions);
+    batchList.append(row);
+  });
+}
+
+async function loadBatches({ quiet = false } = {}) {
+  if (!me || !me.user) {
+    renderBatches([]);
+    if (!quiet) setBatchStatus("请先登录。", true);
+    return;
+  }
+  try {
+    const response = await fetch("/api/batches");
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || `查不到批量任务（${response.status}）`);
+    renderBatches(data.result);
+    if (!quiet) setBatchStatus("列表已刷新。");
+  } catch (error) {
+    renderBatches([]);
+    if (!quiet) setBatchStatus(error.message, true);
+  }
+}
+
+async function batchAction(id, path, options, done) {
+  try {
+    const response = await fetch(`/api/batches/${encodeURIComponent(id)}${path}`, options);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || `请求失败（${response.status}）`);
+    setBatchStatus(done(data));
+    await loadBatches({ quiet: true });
+  } catch (error) {
+    setBatchStatus(error.message, true);
+  }
+}
+
+function refreshBatch(id) {
+  return batchAction(id, "", {}, (data) => `${id}：${batchSummary(data.result)}`);
+}
+
+function cancelBatch(id) {
+  return batchAction(id, "/cancel", { method: "POST" }, (data) => `${id}：${batchSummary(data.result)}`);
+}
+
+function deleteBatch(id) {
+  if (!window.confirm(`删除批量任务 ${id}？`)) return undefined;
+  return batchAction(id, "", { method: "DELETE" }, () => `已删除 ${id}。`);
+}
+
+async function submitBatch() {
+  if (batchBusy) return;
+  if (!me || !me.user) {
+    setBatchStatus("请先登录。", true);
+    return;
+  }
+  const prompts = batchPrompts.value.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (!prompts.length) {
+    setBatchStatus("至少写一条提示词。", true);
+    return;
+  }
+  const model = batchModel.value.trim();
+  if (!model) {
+    setBatchStatus("请填写模型名。", true);
+    return;
+  }
+  batchBusy = true;
+  batchSubmit.disabled = true;
+  setBatchStatus(`正在提交 ${prompts.length} 条…`);
+  try {
+    const response = await fetch("/api/batches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        provider: batchProvider.value,
+        image_size: batchSize.value,
+        response_mime_type: "image/png",
+        items: prompts.map((prompt, index) => ({ custom_id: `item_${index + 1}`, prompt, output_count: 1 })),
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (typeof data.quota === "number" && me.user) {
+      me.user.quota = data.quota;
+      renderAuth();
+    }
+    if (!response.ok || !data.ok) throw new Error(data.error || `提交失败（${response.status}）`);
+    batchPrompts.value = "";
+    setBatchStatus(`已提交 ${data.outputs} 条，扣了 ${data.cost} 额度。`);
+    await loadBatches({ quiet: true });
+  } catch (error) {
+    setBatchStatus(error.message, true);
+  } finally {
+    batchBusy = false;
+    batchSubmit.disabled = false;
+  }
+}
+
+batchSubmit.addEventListener("click", submitBatch);
+batchRefresh.addEventListener("click", () => loadBatches());
 
 loadPrefs();
 fillModels();

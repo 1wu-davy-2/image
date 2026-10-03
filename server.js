@@ -1,15 +1,22 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
+const { Readable } = require("node:stream");
+const { pipeline } = require("node:stream/promises");
 const store = require("./store");
 
 const PORT = Number(process.env.PORT) || 3780;
 const PUBLIC_DIR = path.resolve(__dirname, "public");
 const ALLOWED_HOSTS = new Set(["uuapi.io", "uuapi.net", "uuapi.shop", "uuapi.cc"]);
-const BODY_LIMIT = 14 * 1024 * 1024;
-const IMAGE_LIMIT = 8 * 1024 * 1024;
+// Images Edits takes files up to 20MB, and base64 inflates them by a third.
+const BODY_LIMIT = 32 * 1024 * 1024;
+const IMAGE_LIMIT = 20 * 1024 * 1024;
 const POLL_DEADLINE_MS = 180000;
 const UPSTREAM_TIMEOUT_MS = 120000;
+const DEFAULT_USER_AGENT = "darkroom/1.0 (local image studio)";
+const BATCH_PROTOCOL = "gemini-batch";
+const BATCH_OUTPUT_LIMIT = 200;
+const BATCH_ITEM_OUTPUT_LIMIT = 4;
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -84,7 +91,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const PROTOCOLS = new Set(["gpt", "nano", "gemini-official"]);
+const PROTOCOLS = new Set(["gpt", "nano", "gemini-official", BATCH_PROTOCOL]);
 const RATIOS = new Set(["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16"]);
 const TIERS = new Set(["1K", "2K", "4K"]);
 const STUDIO_SIZES = {
@@ -149,6 +156,16 @@ function parseProtocol(protocol) {
   const value = String(protocol || "gpt").trim();
   if (!PROTOCOLS.has(value)) throw new HttpError(400, "请选择调用方式");
   return value;
+}
+
+// Every upstream call carries the Key's own User-Agent when one is set: relays
+// fronted by an external-client policy reject the default Node agent.
+function authHeaders(key, extra) {
+  return {
+    Authorization: `Bearer ${key.apiKey}`,
+    "User-Agent": String(key.userAgent || "").trim() || DEFAULT_USER_AGENT,
+    ...extra,
+  };
 }
 
 function parseRatio(ratio) {
@@ -272,15 +289,15 @@ async function readUpstream(response) {
   return parseJson(text);
 }
 
-function decodeImage(image) {
+function decodeImage(image, label = "参考图") {
   const mime = String(image?.mime || "");
   if (!["image/png", "image/jpeg", "image/webp"].includes(mime)) {
-    throw new HttpError(400, "参考图只支持 PNG、JPEG、WebP");
+    throw new HttpError(400, `${label}只支持 PNG、JPEG、WebP`);
   }
   const data = String(image?.data || "").replace(/\s+/g, "");
-  if (!data) throw new HttpError(400, "参考图是空的");
+  if (!data) throw new HttpError(400, `${label}是空的`);
   const buffer = Buffer.from(data, "base64");
-  if (!buffer.length || buffer.length > IMAGE_LIMIT) throw new HttpError(400, "参考图需小于 8MB");
+  if (!buffer.length || buffer.length > IMAGE_LIMIT) throw new HttpError(400, `${label}需小于 ${IMAGE_LIMIT / 1024 / 1024}MB`);
   const name = String(image.name || "reference.png").replace(/[^\w.-]+/g, "_").slice(0, 80) || "reference.png";
   return { mime, buffer, name };
 }
@@ -303,13 +320,10 @@ function assertPublicImageUrl(raw) {
   return url.href;
 }
 
-function buildRequest(key, payload, file) {
+function buildRequest(credential, payload, file, mask) {
   if (!file) {
     return {
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
+      headers: authHeaders(credential, { "Content-Type": "application/json" }),
       body: JSON.stringify(payload),
     };
   }
@@ -319,7 +333,8 @@ function buildRequest(key, payload, file) {
   form.set("size", payload.size);
   if (payload.quality) form.set("quality", payload.quality);
   form.set("image", new Blob([file.buffer], { type: file.mime }), file.name);
-  return { headers: { Authorization: `Bearer ${key}` }, body: form };
+  if (mask) form.set("mask", new Blob([mask.buffer], { type: mask.mime }), mask.name);
+  return { headers: authHeaders(credential), body: form };
 }
 
 function chatText(payload) {
@@ -400,8 +415,8 @@ function shouldTryChat(status) {
   return status === 400 || status === 404 || status === 405 || status === 422 || status === 501;
 }
 
-async function syncImages(base, key, syncPath, payload, file) {
-  const synced = await callUpstream(`${base}${syncPath}`, { method: "POST", ...buildRequest(key, payload, file) });
+async function syncImages(base, credential, syncPath, payload, file, mask) {
+  const synced = await callUpstream(`${base}${syncPath}`, { method: "POST", ...buildRequest(credential, payload, file, mask) });
   const payloadSync = await readUpstream(synced);
   if (!synced.ok) throw new HttpError(synced.status, errorMessage(payloadSync, synced.status));
   const images = collectImages(payloadSync);
@@ -409,7 +424,7 @@ async function syncImages(base, key, syncPath, payload, file) {
   return { channel: "sync", taskId: "", images };
 }
 
-async function generateViaChat(base, key, spec) {
+async function generateViaChat(base, credential, spec) {
   const content = [{ type: "text", text: spec.prompt }];
   if (spec.file) {
     content.push({
@@ -421,7 +436,7 @@ async function generateViaChat(base, key, spec) {
   }
   const response = await callUpstream(`${base}/chat/completions`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    headers: authHeaders(credential, { "Content-Type": "application/json" }),
     body: JSON.stringify({
       model: spec.model,
       stream: false,
@@ -452,13 +467,15 @@ async function downloadReference(raw) {
       throw new HttpError(400, "参考图只支持 PNG、JPEG、WebP");
     }
     const buffer = Buffer.from(await response.arrayBuffer());
-    if (!buffer.length || buffer.length > IMAGE_LIMIT) throw new HttpError(400, "参考图需小于 8MB");
+    if (!buffer.length || buffer.length > IMAGE_LIMIT) {
+      throw new HttpError(400, `参考图需小于 ${IMAGE_LIMIT / 1024 / 1024}MB`);
+    }
     return { mime, buffer, name: "reference" };
   }
   throw new HttpError(400, "参考图重定向过多");
 }
 
-async function generateOfficial(origin, key, spec) {
+async function generateOfficial(origin, credential, spec) {
   const parts = [];
   if (spec.file) {
     parts.push({ inlineData: { mimeType: spec.file.mime, data: spec.file.buffer.toString("base64") } });
@@ -469,7 +486,7 @@ async function generateOfficial(origin, key, spec) {
   parts.push({ text: spec.prompt });
   const response = await callUpstream(`${origin}/v1beta/models/${encodeURIComponent(spec.model)}:generateContent`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    headers: authHeaders(credential, { "Content-Type": "application/json" }),
     body: JSON.stringify({
       contents: [{ role: "user", parts }],
       generationConfig: {
@@ -489,20 +506,21 @@ async function generateOfficial(origin, key, spec) {
   return { channel: "gemini", taskId: "", images };
 }
 
-async function generateOpenAI(base, key, spec, fallback) {
+async function generateOpenAI(base, credential, spec, fallback) {
   const payload = { model: spec.model, prompt: spec.prompt, size: spec.size, response_format: "url" };
   if (spec.quality) payload.quality = spec.quality;
   if (spec.mode === "edit" && spec.imageUrl) payload.images = [{ image_url: spec.imageUrl }];
+  if (spec.mode === "edit" && spec.maskUrl) payload.mask = { image_url: spec.maskUrl };
   const asyncPath = spec.mode === "edit" ? "/images/edits/async" : "/images/generations/async";
   const syncPath = spec.mode === "edit" ? "/images/edits" : "/images/generations";
-  const queued = await callUpstream(`${base}${asyncPath}`, { method: "POST", ...buildRequest(key, payload, spec.file) });
+  const queued = await callUpstream(`${base}${asyncPath}`, { method: "POST", ...buildRequest(credential, payload, spec.file, spec.mask) });
   if (queued.status >= 300 && queued.status < 400) throw new HttpError(502, "上游返回了重定向，已中止");
 
   if (fallback === "chat" && shouldTryChat(queued.status)) {
     const errPayload = await readUpstream(queued);
     const imagesError = errorMessage(errPayload, queued.status);
     try {
-      return await generateViaChat(base, key, spec);
+      return await generateViaChat(base, credential, spec);
     } catch (error) {
       if (queued.status === 404 || queued.status === 405 || queued.status === 501) throw error;
       const message = error instanceof HttpError ? error.message : "对话生图失败";
@@ -510,7 +528,7 @@ async function generateOpenAI(base, key, spec, fallback) {
     }
   }
   if (fallback === "sync" && (queued.status === 404 || queued.status === 405 || queued.status === 501)) {
-    return syncImages(base, key, syncPath, payload, spec.file);
+    return syncImages(base, credential, syncPath, payload, spec.file, spec.mask);
   }
 
   const queuedPayload = await readUpstream(queued);
@@ -528,16 +546,16 @@ async function generateOpenAI(base, key, spec, fallback) {
   const taskId = taskIdOf(queuedPayload, queued);
   if (!taskId) throw new HttpError(502, errorMessage(queuedPayload, queued.status) || "异步接口没有返回任务编号");
   if (immediate.length && isDoneStatus(queuedStatus)) return { channel: "async", taskId, images: immediate };
-  const polled = await pollTask(base, key, taskId);
+  const polled = await pollTask(base, credential, taskId);
   return { channel: "async", ...polled };
 }
 
-async function pollTask(base, key, taskId) {
+async function pollTask(base, credential, taskId) {
   const deadline = Date.now() + POLL_DEADLINE_MS;
   while (Date.now() < deadline) {
     const response = await callUpstream(`${base}/images/tasks/${encodeURIComponent(taskId)}`, {
       method: "GET",
-      headers: { Authorization: `Bearer ${key}` },
+      headers: authHeaders(credential),
     });
     const payload = await readUpstream(response);
     if (response.status >= 300 && response.status < 400) throw new HttpError(502, "轮询被重定向，已中止");
@@ -556,44 +574,216 @@ async function pollTask(base, key, taskId) {
   throw new HttpError(504, "生图超时，任务仍在处理。可稍后用任务号到中转站查询");
 }
 
+/* ---------- 批量生图：/v1/images/batches 一族接口的代理 ---------- */
+
+const BATCH_ID = /^[\w.-]{1,120}$/;
+const BATCH_CUSTOM_ID = /^[\w.-]{1,64}$/;
+const BATCH_MIMES = ["image/png", "image/jpeg", "image/webp"];
+
+function batchUrl(key, suffix) {
+  return `${openaiBase(key.baseUrl)}/images/batches${suffix}`;
+}
+
+async function callBatch(key, method, suffix, body) {
+  const options = { method, headers: authHeaders(key) };
+  if (body !== undefined) {
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const response = await callUpstream(batchUrl(key, suffix), options);
+  if (response.status >= 300 && response.status < 400) throw new HttpError(502, "上游返回了重定向，已中止");
+  return response;
+}
+
+async function batchJson(key, method, suffix, body) {
+  const response = await callBatch(key, method, suffix, body);
+  const payload = await readUpstream(response);
+  if (!response.ok) throw new HttpError(response.status, errorMessage(payload, response.status));
+  return payload;
+}
+
+// /download 和 /items/{custom_id}/content 直接回图片或 ZIP，不能当 JSON 读。
+async function pipeUpstream(res, response) {
+  const headers = {
+    "Content-Type": response.headers.get("content-type") || "application/octet-stream",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+  };
+  const length = response.headers.get("content-length");
+  if (length) headers["Content-Length"] = length;
+  const disposition = response.headers.get("content-disposition");
+  if (disposition) headers["Content-Disposition"] = disposition;
+  res.writeHead(response.status, headers);
+  if (!response.body) {
+    res.end();
+    return;
+  }
+  await pipeline(Readable.fromWeb(response.body), res).catch(() => {});
+}
+
+function normalizeBatchItem(item, index) {
+  if (!item || typeof item !== "object") throw new HttpError(400, `第 ${index + 1} 个条目不是对象`);
+  const customId = String(item.custom_id || `item_${index + 1}`).trim();
+  if (!BATCH_CUSTOM_ID.test(customId)) {
+    throw new HttpError(400, `第 ${index + 1} 个条目的 custom_id 只能用字母、数字、下划线、点和短横线`);
+  }
+  const raw = item.output_count;
+  const outputCount = raw === undefined || raw === null || raw === "" ? 1 : Number(raw);
+  if (!Number.isInteger(outputCount) || outputCount < 1 || outputCount > BATCH_ITEM_OUTPUT_LIMIT) {
+    throw new HttpError(400, `第 ${index + 1} 个条目的 output_count 需要是 1 到 ${BATCH_ITEM_OUTPUT_LIMIT} 的整数`);
+  }
+  const out = { custom_id: customId, prompt: requirePrompt(item.prompt), output_count: outputCount };
+  if (Array.isArray(item.reference_images) && item.reference_images.length) {
+    out.reference_images = item.reference_images.slice(0, 8).map((url) => assertPublicImageUrl(url));
+  }
+  return out;
+}
+
+function parseBatchBody(body) {
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!items.length) throw new HttpError(400, "批量任务至少要有一个条目");
+  if (items.length > BATCH_OUTPUT_LIMIT) throw new HttpError(400, `单个批量任务最多 ${BATCH_OUTPUT_LIMIT} 个条目`);
+  const normalized = items.map(normalizeBatchItem);
+  const outputs = normalized.reduce((sum, item) => sum + item.output_count, 0);
+  if (outputs > BATCH_OUTPUT_LIMIT) {
+    throw new HttpError(400, `单个批量任务最多 ${BATCH_OUTPUT_LIMIT} 个输出，现在是 ${outputs} 个`);
+  }
+  const provider = String(body.provider || "gemini_api").trim().slice(0, 40);
+  if (!provider) throw new HttpError(400, "请填写 provider");
+  const payload = { model: parseModel(body.model), provider, items: normalized };
+  const imageSize = String(body.image_size || "").trim();
+  if (imageSize) payload.image_size = parseTier(imageSize);
+  const mime = String(body.response_mime_type || "").trim();
+  if (mime) {
+    if (!BATCH_MIMES.includes(mime)) throw new HttpError(400, "response_mime_type 只支持 image/png、image/jpeg、image/webp");
+    payload.response_mime_type = mime;
+  }
+  return { payload, outputs };
+}
+
+async function handleBatches(req, res, user, url) {
+  const match = /^\/api\/batches\/([^/]+)(\/.*)?$/.exec(url.pathname);
+  if (!match) {
+    if (req.method === "GET") {
+      const key = await store.keyFor(BATCH_PROTOCOL);
+      sendJson(res, 200, { ok: true, result: await batchJson(key, "GET", url.search || "") });
+      return;
+    }
+    if (req.method === "POST") {
+      const { payload, outputs } = parseBatchBody(await readJson(req));
+      const reserved = await store.reserveGeneration(user.id, BATCH_PROTOCOL, outputs);
+      try {
+        const result = await batchJson(reserved.key, "POST", "", payload);
+        const latest = await store.sessionUser(cookiesOf(req).darkroom_user);
+        sendJson(res, 200, { ok: true, result, cost: reserved.cost, outputs, quota: latest ? latest.quota : reserved.quota });
+      } catch (error) {
+        // The task never reached the relay, so hand the quota back.
+        const quota = await store.refund(user.id, reserved.cost);
+        if (error instanceof HttpError || error.status) error.quota = quota;
+        throw error;
+      }
+      return;
+    }
+    sendJson(res, 405, { ok: false, error: "不支持的方法" });
+    return;
+  }
+
+  const id = match[1];
+  if (!BATCH_ID.test(id)) throw new HttpError(400, "批量任务编号不合法");
+  const sub = match[2] || "";
+  const content = /^\/items\/([^/]+)\/content$/.exec(sub);
+  if (content && !BATCH_CUSTOM_ID.test(content[1])) throw new HttpError(400, "条目编号不合法");
+  // batchUrl() already supplies the /images/batches prefix, so this is id-only.
+  const encoded = `/${encodeURIComponent(id)}`;
+
+  if (sub === "" && req.method === "GET") {
+    const key = await store.keyFor(BATCH_PROTOCOL);
+    sendJson(res, 200, { ok: true, result: await batchJson(key, "GET", encoded) });
+    return;
+  }
+  if (sub === "" && req.method === "DELETE") {
+    const key = await store.keyFor(BATCH_PROTOCOL);
+    sendJson(res, 200, { ok: true, result: await batchJson(key, "DELETE", encoded) });
+    return;
+  }
+  if (sub === "/items" && req.method === "GET") {
+    const key = await store.keyFor(BATCH_PROTOCOL);
+    sendJson(res, 200, { ok: true, result: await batchJson(key, "GET", `${encoded}/items`) });
+    return;
+  }
+  if (sub === "/cancel" && req.method === "POST") {
+    const key = await store.keyFor(BATCH_PROTOCOL);
+    sendJson(res, 200, { ok: true, result: await batchJson(key, "POST", `${encoded}/cancel`, {}) });
+    return;
+  }
+  if (sub === "/outputs" && req.method === "DELETE") {
+    const key = await store.keyFor(BATCH_PROTOCOL);
+    sendJson(res, 200, { ok: true, result: await batchJson(key, "DELETE", `${encoded}/outputs`) });
+    return;
+  }
+
+  const rawSuffix = sub === "/download" && req.method === "GET" ? `${encoded}/download`
+    : content && req.method === "GET" ? `${encoded}/items/${encodeURIComponent(content[1])}/content`
+    : "";
+  if (rawSuffix) {
+    const key = await store.keyFor(BATCH_PROTOCOL);
+    const response = await callBatch(key, "GET", rawSuffix);
+    if (!response.ok) {
+      throw new HttpError(response.status, errorMessage(await readUpstream(response), response.status));
+    }
+    await pipeUpstream(res, response);
+    return;
+  }
+
+  sendJson(res, 405, { ok: false, error: "不支持的方法" });
+}
+
 function asNumber(value) {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
   return null;
 }
 
+function firstNumber(...values) {
+  for (const value of values) {
+    const number = asNumber(value);
+    if (number !== null) return number;
+  }
+  return null;
+}
+
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+// Mirrors the extractor cc-switch uses when the relay is imported, so the
+// balance shown here and the balance shown there come from the same fields.
 function pickBalance(payload) {
   if (!payload || typeof payload !== "object") return null;
-  const quotaRemaining = payload.quota && typeof payload.quota === "object" ? asNumber(payload.quota.remaining) : null;
-  const candidates = [
-    asNumber(payload.balance),
-    asNumber(payload.remaining),
-    quotaRemaining,
-    asNumber(payload.data?.balance),
-    asNumber(payload.data?.remaining),
-  ];
-  const balance = candidates.find((value) => value !== null && value !== undefined);
-  if (balance === undefined) return null;
-  return { balance, unit: payload.unit || payload.quota?.unit || "USD" };
+  const balance = firstNumber(payload.remaining, payload.quota?.remaining, payload.balance);
+  if (balance === null) return null;
+  const valid = payload.is_active ?? payload.isValid;
+  return {
+    balance,
+    unit: firstString(payload.unit, payload.quota?.unit) || "USD",
+    valid: typeof valid === "boolean" ? valid : null,
+  };
 }
 
 async function fetchKeyBalance(key) {
-  const base = openaiBase(key.baseUrl);
-  const headers = { Authorization: `Bearer ${key.apiKey}` };
-  let lastError = "没有查到余额";
-  for (const url of [`${base}/usage`, `${base}/sub2api/billing`]) {
-    const response = await callUpstream(url, { method: "GET", headers });
-    const payload = await readUpstream(response);
-    if (!response.ok) {
-      lastError = errorMessage(payload, response.status);
-      if (response.status === 401 || response.status === 403) throw new HttpError(response.status, lastError);
-      continue;
-    }
-    const picked = pickBalance(payload);
-    if (picked) return picked;
-    lastError = "余额接口没有返回数字";
-  }
-  throw new HttpError(502, lastError);
+  // {{baseUrl}} with any trailing /v1 stripped, then /v1/usage.
+  const response = await callUpstream(`${relayOrigin(key.baseUrl)}/v1/usage`, {
+    method: "GET",
+    headers: authHeaders(key),
+  });
+  const payload = await readUpstream(response);
+  if (!response.ok) throw new HttpError(response.status, errorMessage(payload, response.status));
+  const picked = pickBalance(payload);
+  if (!picked) throw new HttpError(502, "余额接口没有返回数字");
+  return picked;
 }
 
 async function rememberBalance(id, fresh, error) {
@@ -619,7 +809,8 @@ function requirePrompt(prompt) {
 
 async function generate(input) {
   const protocol = parseProtocol(input.protocol);
-  const key = requireKey(input.apiKey);
+  if (protocol === BATCH_PROTOCOL) throw new HttpError(400, "批量生图请用 /api/batches 提交");
+  const credential = { apiKey: requireKey(input.apiKey), userAgent: input.userAgent };
   const model = parseModel(input.model);
   const prompt = requirePrompt(input.prompt);
   const mode = input.mode === "edit" ? "edit" : "generate";
@@ -630,23 +821,39 @@ async function generate(input) {
     else if (String(input.imageUrl || "").trim()) imageUrl = assertPublicImageUrl(input.imageUrl);
     else throw new HttpError(400, "图生图需要上传参考图，或填写 https 图片地址");
   }
-  const spec = { model, prompt, mode, file, imageUrl };
+  const spec = { model, prompt, mode, file, imageUrl, mask: null, maskUrl: "" };
+  if ((input.mask && input.mask.data) || String(input.maskUrl || "").trim()) {
+    if (mode !== "edit") throw new HttpError(400, "蒙版只在图生图时可用");
+    if (protocol === "gemini-official") throw new HttpError(400, "Gemini 官方直连不支持蒙版，请改用 GPT 或香蕉生图");
+    if (input.mask && input.mask.data) spec.mask = decodeImage(input.mask, "蒙版");
+    else spec.maskUrl = assertPublicImageUrl(input.maskUrl);
+    // Upstream only models two shapes: both files, or both URLs. When the pair is
+    // mixed, pull the URL side down so everything travels as multipart files —
+    // otherwise the mask would be dropped without a word.
+    if (spec.mask && spec.imageUrl) {
+      spec.file = await downloadReference(spec.imageUrl);
+      spec.imageUrl = "";
+    } else if (spec.maskUrl && spec.file) {
+      spec.mask = await downloadReference(spec.maskUrl);
+      spec.maskUrl = "";
+    }
+  }
 
   if (protocol === "gemini-official") {
     spec.aspectRatio = parseRatio(input.aspectRatio);
     spec.imageSize = parseTier(input.imageSize);
-    return generateOfficial(relayOrigin(input.baseUrl || "https://uuapi.io"), key, spec);
+    return generateOfficial(relayOrigin(input.baseUrl || "https://uuapi.io"), credential, spec);
   }
 
   const base = openaiBase(input.baseUrl || "https://uuapi.io/v1");
   if (protocol === "nano") {
     spec.size = parseSize(pixelsFor(parseRatio(input.aspectRatio), parseTier(input.imageSize)));
-    return generateOpenAI(base, key, spec, "chat");
+    return generateOpenAI(base, credential, spec, "chat");
   }
 
   spec.size = parseSize(input.size);
   spec.quality = parseQuality(input.quality);
-  return generateOpenAI(base, key, spec, "sync");
+  return generateOpenAI(base, credential, spec, "sync");
 }
 
 function normalizeKeyInput(input) {
@@ -667,6 +874,7 @@ function normalizeKeyInput(input) {
     protocol,
     baseUrl: baseUrl || (protocol === "gemini-official" ? "https://uuapi.io" : "https://uuapi.io/v1"),
     apiKey,
+    userAgent: String(input.userAgent || "").trim().slice(0, 200),
     balance,
     enabled: input.enabled !== false,
     note: input.note,
@@ -735,13 +943,31 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { ok: true, ...result });
       return;
     }
+    if (req.method === "POST" && url.pathname === "/api/me/password") {
+      const user = await requireUser(req);
+      const body = await readJson(req);
+      await store.changeUserPassword(user.id, body.oldPassword, body.newPassword);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (url.pathname === "/api/batches" || url.pathname.startsWith("/api/batches/")) {
+      const user = await requireUser(req);
+      await handleBatches(req, res, user, url);
+      return;
+    }
     if (req.method === "POST" && url.pathname === "/api/generate") {
       const user = await requireUser(req);
       const input = await readJson(req);
       const protocol = parseProtocol(input.protocol);
       const reserved = await store.reserveGeneration(user.id, protocol);
       try {
-        const result = await generate({ ...input, protocol, apiKey: reserved.key.apiKey, baseUrl: reserved.key.baseUrl });
+        const result = await generate({
+          ...input,
+          protocol,
+          apiKey: reserved.key.apiKey,
+          baseUrl: reserved.key.baseUrl,
+          userAgent: reserved.key.userAgent,
+        });
         console.log(`[generate] ${result.channel} protocol=${protocol} model=${parseModel(input.model)} images=${result.images.length}`);
         const latest = await store.sessionUser(cookiesOf(req).darkroom_user);
         sendJson(res, 200, { ok: true, ...result, quota: latest ? latest.quota : reserved.quota });
@@ -817,7 +1043,24 @@ const server = http.createServer(async (req, res) => {
       await requireAdmin(req);
       const id = decodeURIComponent(url.pathname.slice("/api/admin/users/".length));
       const body = await readJson(req);
-      const user = await store.setUserQuota(id, Number(body.quota));
+      let user = null;
+      if (body.quota !== undefined) user = await store.setUserQuota(id, Number(body.quota));
+      if (body.disabled !== undefined) user = await store.setUserDisabled(id, body.disabled);
+      if (!user) throw new HttpError(400, "没有要修改的字段");
+      sendJson(res, 200, { ok: true, user });
+      return;
+    }
+    if (req.method === "DELETE" && url.pathname.startsWith("/api/admin/users/")) {
+      await requireAdmin(req);
+      await store.deleteUser(decodeURIComponent(url.pathname.slice("/api/admin/users/".length)));
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === "POST" && /^\/api\/admin\/users\/[^/]+\/password$/.test(url.pathname)) {
+      await requireAdmin(req);
+      const id = decodeURIComponent(url.pathname.slice("/api/admin/users/".length, -"/password".length));
+      const body = await readJson(req);
+      const user = await store.resetUserPassword(id, body.password);
       sendJson(res, 200, { ok: true, user });
       return;
     }

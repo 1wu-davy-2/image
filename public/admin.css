@@ -22,6 +22,8 @@ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line
 th { color: var(--muted); font-weight: 500; }
 .money { font-variant-numeric: tabular-nums; }
 .bad { color: var(--danger); }
+.sub { margin-top: 2px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.row-actions { justify-content: flex-start; flex-wrap: wrap; }
 .row-actions button, .user-save {
   border: 1px solid var(--line);
   background: transparent;

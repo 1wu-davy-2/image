@@ -2,6 +2,7 @@ const PROTOCOL_LABEL = {
   gpt: "GPT",
   nano: "香蕉",
   "gemini-official": "官方直连",
+  "gemini-batch": "批量",
 };
 
 const loginView = document.querySelector("#loginView");
@@ -47,6 +48,7 @@ function fillForm(key) {
   document.querySelector("#keyProtocol").value = key ? key.protocol : "gpt";
   document.querySelector("#keyBase").value = key ? key.baseUrl : "https://uuapi.io/v1";
   document.querySelector("#keySecret").value = "";
+  document.querySelector("#keyAgent").value = key ? key.userAgent || "" : "";
   document.querySelector("#keyBalance").value = key && typeof key.balance === "number" ? String(key.balance) : "";
   document.querySelector("#keyEnabled").checked = key ? key.enabled !== false : true;
   document.querySelector("#keyNote").value = key ? key.note || "" : "";
@@ -66,11 +68,21 @@ function render() {
     const row = document.createElement("tr");
     const name = document.createElement("td");
     name.textContent = key.name;
+    const sub = document.createElement("div");
+    sub.className = "sub";
+    sub.textContent = key.userAgent ? `UA: ${key.userAgent}` : "UA: 默认";
+    name.append(sub);
     const kind = document.createElement("td");
     kind.textContent = PROTOCOL_LABEL[key.protocol] || key.protocol;
     const money = document.createElement("td");
     money.className = "money";
     money.textContent = balanceText(key);
+    if (key.balanceValid === false) {
+      const invalid = document.createElement("div");
+      invalid.className = "bad";
+      invalid.textContent = "Key 已失效（is_active 为 false）";
+      money.append(invalid);
+    }
     if (key.balanceError) {
       const error = document.createElement("div");
       error.className = "bad";
@@ -121,14 +133,29 @@ function render() {
     amount.append(input);
     const checkin = document.createElement("td");
     checkin.textContent = user.checkedInToday ? `${user.lastCheckinDate} · 今日已签` : (user.lastCheckinDate || "从未");
+    const stateCell = document.createElement("td");
+    stateCell.textContent = user.disabled ? "已停用" : "正常";
+    if (user.disabled) stateCell.className = "bad";
     const actions = document.createElement("td");
+    actions.className = "row-actions";
     const save = document.createElement("button");
     save.type = "button";
-    save.className = "user-save";
-    save.textContent = "保存";
+    save.textContent = "保存额度";
     save.addEventListener("click", () => saveQuota(user, input, save));
-    actions.append(save);
-    row.append(name, amount, checkin, actions);
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.textContent = "重置密码";
+    reset.addEventListener("click", () => resetPassword(user));
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.textContent = user.disabled ? "启用" : "停用";
+    toggle.addEventListener("click", () => toggleDisabled(user, toggle));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => removeUser(user));
+    actions.append(save, reset, toggle, remove);
+    row.append(name, amount, checkin, stateCell, actions);
     userRows.append(row);
   });
 }
@@ -176,6 +203,47 @@ async function saveQuota(user, input, button) {
     setStatus(userStatus, error.message, true);
   } finally {
     button.disabled = false;
+  }
+}
+
+async function resetPassword(user) {
+  const password = window.prompt(`给「${user.username}」设置新密码（6 到 72 位）：`);
+  if (password === null) return;
+  try {
+    await api(`/api/admin/users/${encodeURIComponent(user.id)}/password`, {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    });
+    setStatus(userStatus, `${user.username} 的密码已重置，之前的登录都失效了。`);
+  } catch (error) {
+    setStatus(userStatus, error.message, true);
+  }
+}
+
+async function toggleDisabled(user, button) {
+  button.disabled = true;
+  try {
+    await api(`/api/admin/users/${encodeURIComponent(user.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ disabled: !user.disabled }),
+    });
+    await loadState();
+    setStatus(userStatus, user.disabled ? `已启用 ${user.username}。` : `已停用 ${user.username}，他的登录都失效了。`);
+  } catch (error) {
+    setStatus(userStatus, error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function removeUser(user) {
+  if (!window.confirm(`删除用户「${user.username}」？他的额度记录会一起消失。`)) return;
+  try {
+    await api(`/api/admin/users/${encodeURIComponent(user.id)}`, { method: "DELETE" });
+    await loadState();
+    setStatus(userStatus, `已删除 ${user.username}。`);
+  } catch (error) {
+    setStatus(userStatus, error.message, true);
   }
 }
 
@@ -249,6 +317,12 @@ document.querySelectorAll("[data-origin]").forEach((button) => {
   });
 });
 
+document.querySelectorAll("[data-agent]").forEach((button) => {
+  button.addEventListener("click", () => {
+    document.querySelector("#keyAgent").value = button.dataset.agent;
+  });
+});
+
 document.querySelector("#resetKey").addEventListener("click", () => fillForm(null));
 
 document.querySelector("#keyForm").addEventListener("submit", async (event) => {
@@ -260,6 +334,7 @@ document.querySelector("#keyForm").addEventListener("submit", async (event) => {
     protocol: document.querySelector("#keyProtocol").value,
     baseUrl: document.querySelector("#keyBase").value,
     apiKey: document.querySelector("#keySecret").value,
+    userAgent: document.querySelector("#keyAgent").value,
     balance: balanceRaw === "" ? null : Number(balanceRaw),
     enabled: document.querySelector("#keyEnabled").checked,
     note: document.querySelector("#keyNote").value,

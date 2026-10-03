@@ -54,10 +54,26 @@
               </div>
               <div class="account-actions">
                 <button type="button" id="checkinBtn">签到领额度</button>
+                <button type="button" id="passwordToggle">改密码</button>
                 <button type="button" id="logoutBtn">退出</button>
               </div>
             </div>
             <p id="checkinHint" class="hint"></p>
+            <div id="passwordBox" class="hidden">
+              <div class="auth-grid">
+                <div>
+                  <label for="oldPassword">原密码</label>
+                  <input id="oldPassword" type="password" autocomplete="current-password" />
+                </div>
+                <div>
+                  <label for="newPassword">新密码</label>
+                  <input id="newPassword" type="password" autocomplete="new-password" />
+                </div>
+              </div>
+              <div class="account-actions">
+                <button type="button" id="changePasswordBtn">保存新密码</button>
+              </div>
+            </div>
           </div>
         </fieldset>
 
@@ -88,6 +104,11 @@
             <input id="imageFile" name="imageFile" type="file" accept="image/png,image/jpeg,image/webp" />
             <label for="imageUrl">或图片 URL</label>
             <input id="imageUrl" name="imageUrl" type="url" placeholder="https://example.com/reference.png" />
+            <label for="maskFile">蒙版（可选，透明的地方会被重绘）</label>
+            <input id="maskFile" name="maskFile" type="file" accept="image/png,image/jpeg,image/webp" />
+            <label for="maskUrl">或蒙版 URL</label>
+            <input id="maskUrl" name="maskUrl" type="url" placeholder="https://example.com/mask.png" />
+            <p class="hint">蒙版只对 GPT 和香蕉生图有效，Gemini 官方直连不支持。</p>
           </div>
 
           <div id="pixelSize" class="split">
@@ -156,6 +177,8 @@
             <p><strong>GPT 生图</strong>：<code>POST /v1/images/generations</code>，编辑是 <code>/v1/images/edits</code>。先走异步再轮询 <code>/v1/images/tasks/{task_id}</code>，异步不存在时改同步。字段有 <code>model</code>、<code>prompt</code>、<code>size</code>、<code>quality</code>。示例模型 <code>gpt-image-2.5-flare</code>、<code>gpt-image-1</code>。</p>
             <p><strong>Nano Banana</strong>：同一套生图接口，模型用 <code>gemini-2.5-flash-image</code>（香蕉）、<code>gemini-3-pro-image</code>、<code>gemini-3.1-flash-image</code>。生图接口不收这个模型时，改走 <code>POST /v1/chat/completions</code>，和 UU 控制台对 Gemini 分组的做法一致。</p>
             <p><strong>GEMINI官方直连-带生图</strong>：<code>POST /v1beta/models/{模型}:generateContent</code>。正文是 Gemini 官方格式，<code>generationConfig.responseModalities</code> 含 <code>IMAGE</code>，画幅和分辨率放在 <code>imageConfig</code>。参考图以 <code>inlineData</code> 放进 <code>contents</code>。</p>
+            <p><strong>Gemini 批量生图</strong>：<code>POST /v1/images/batches</code>，正文是 <code>model</code>、<code>provider</code>、<code>items</code>。之后用 <code>GET /v1/images/batches/{id}</code> 查状态、<code>/items</code> 看条目、<code>/download</code> 取 ZIP，还能 <code>/cancel</code> 取消。这一族要单独配一把「Gemini 批量生图」类型的 Key。</p>
+            <p><strong>蒙版</strong>：图生图时可以用 <code>mask</code> 指定只重绘哪一块。GPT 走 multipart 的 <code>mask</code> 文件字段、或 JSON 的 <code>mask.image_url</code>；Gemini 官方直连没有这个能力。</p>
           </div>
         </details>
       </form>
@@ -170,6 +193,40 @@
         <div id="actions" class="actions hidden"></div>
         <h2>最近</h2>
         <div id="history" class="history" aria-live="polite"></div>
+      </section>
+
+      <section class="panel batch" aria-label="批量生图">
+        <fieldset>
+          <legend>批量生图</legend>
+          <p class="hint">走 Gemini 批量接口，一次提交多条。提交时按条目数扣额度，上游受理后不退还。</p>
+          <label for="batchModel">模型</label>
+          <input id="batchModel" value="gemini-2.5-flash-image" spellcheck="false" />
+          <label for="batchPrompts">提示词（一行一条）</label>
+          <textarea id="batchPrompts" rows="4" placeholder="A clean product hero image&#10;A lighthouse during a winter storm"></textarea>
+          <div class="split">
+            <div>
+              <label for="batchSize">分辨率</label>
+              <select id="batchSize">
+                <option value="1K">1K</option>
+                <option value="2K">2K</option>
+                <option value="4K">4K</option>
+              </select>
+            </div>
+            <div>
+              <label for="batchProvider">provider</label>
+              <select id="batchProvider">
+                <option value="gemini_api">gemini_api</option>
+                <option value="vertex">vertex</option>
+              </select>
+            </div>
+          </div>
+          <div class="account-actions">
+            <button type="button" id="batchSubmit">提交批量任务</button>
+            <button type="button" id="batchRefresh">刷新列表</button>
+          </div>
+          <p id="batchStatus" class="status" role="status" aria-live="polite"></p>
+          <div id="batchList" class="batches"></div>
+        </fieldset>
       </section>
     </main>
     <script src="/app.js"></script>

@@ -212,6 +212,44 @@ input:focus, select:focus, textarea:focus { outline: 2px solid rgba(227, 154, 88
 .history button[aria-current="true"] { border-color: var(--copper); }
 .history p { margin: 0; color: var(--muted); }
 
+.row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.row-actions button {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.row-actions button:hover { color: var(--ink); border-color: var(--copper); }
+.row-actions button:disabled { opacity: 0.55; cursor: progress; }
+
+.batch { grid-column: 1 / -1; }
+.batches { display: grid; gap: 8px; margin-top: 12px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.batch-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 8px 10px;
+}
+.batch-row strong { display: block; font-size: 13px; font-weight: 560; overflow-wrap: anywhere; }
+.batch-row small { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
+
+#batchSubmit {
+  border: 0;
+  background: var(--copper);
+  color: var(--copper-ink);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+#batchSubmit:disabled { opacity: 0.55; cursor: progress; }
+
 .hidden { display: none; }
 
 @media (max-width: 860px) {
