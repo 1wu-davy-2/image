@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
-const DATA_DIR = path.join(__dirname, "data");
+const DATA_DIR = path.join(__dirname, "..", "data");
 const STORE_PATH = path.join(DATA_DIR, "store.json");
 const PASSWORD_NOTE = path.join(DATA_DIR, "initial-admin-password.txt");
 const SESSION_MS = 14 * 24 * 60 * 60 * 1000;

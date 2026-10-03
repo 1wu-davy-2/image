@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>暗房 · 管理端</title>
+    <meta name="theme-color" content="#f6f1e6" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%23f6f1e6'/%3E%3Cpath d='M3 11c3-4 7-4 10 0' stroke='%234f6f72' stroke-width='1.4' fill='none'/%3E%3Ccircle cx='8' cy='5.5' r='2' fill='%23c9b07a'/%3E%3C/svg%3E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="top-inner">
+        <div class="brand">
+          <p class="eyebrow">Admin</p>
+          <h1>暗房 · 管理端</h1>
+        </div>
+        <nav class="nav">
+          <a href="./"><span>创作</span></a>
+          <a href="./admin" aria-current="page"><span>管理</span></a>
+        </nav>
+      </div>
+      <div class="motif" aria-hidden="true">
+        <svg viewBox="0 0 1200 36" fill="none">
+          <path d="M20 22c18-14 36-14 54 0s36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0" stroke="currentColor" stroke-opacity="0.45" stroke-width="1" />
+          <path d="M0 12 C80 4, 140 20, 220 10 S360 4, 440 14 600 6, 700 16 860 4, 960 12 1100 6, 1200 14" stroke="var(--gold)" stroke-opacity="0.55" stroke-width="1" />
+          <path d="M90 28c12-10 28-10 40 0M250 28c12-10 28-10 40 0M430 28c12-10 28-10 40 0M610 28c12-10 28-10 40 0M790 28c12-10 28-10 40 0M970 28c12-10 28-10 40 0" stroke="var(--green)" stroke-opacity="0.5" stroke-width="1" />
+          <circle cx="180" cy="10" r="1.6" fill="var(--cinnabar)" opacity="0.55" />
+          <circle cx="520" cy="8" r="1.4" fill="var(--gold)" opacity="0.7" />
+          <circle cx="860" cy="11" r="1.6" fill="var(--cinnabar)" opacity="0.5" />
+        </svg>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <form id="loginView" class="card narrow">
+        <div class="page-head center">
+          <p class="eyebrow">管理</p>
+          <h2>进入账房</h2>
+          <p class="hint">维护 GPT 与 Gemini 的生图 Key，以及每把 Key 的剩余余额和用户额度。</p>
+        </div>
+        <label for="adminUser">管理账号</label>
+        <input id="adminUser" autocomplete="username" value="admin" maxlength="40" required />
+        <label for="adminPassword">管理密码</label>
+        <input id="adminPassword" type="password" autocomplete="current-password" required />
+        <div class="spaced-lg">
+          <button type="submit" class="primary wide">进入</button>
+        </div>
+        <p id="loginStatus" class="status center" role="status"></p>
+      </form>
+
+      <div id="appView" class="hidden">
+        <div class="page-head">
+          <p class="eyebrow">管理</p>
+          <h2>账房</h2>
+          <p>签到规则、生图 Key 与余额、用户额度都在这里维护。</p>
+        </div>
+
+        <div class="stack">
+          <section class="card">
+            <div class="card-head">
+              <h3>签到规则</h3>
+              <button type="button" id="logoutBtn" class="ghost">退出</button>
+            </div>
+            <div class="split">
+              <div>
+                <label for="checkinQuota">每日签到领取额度</label>
+                <input id="checkinQuota" type="number" min="0" max="1000" step="1" />
+              </div>
+              <div>
+                <label for="generateCost">每次生图消耗额度</label>
+                <input id="generateCost" type="number" min="0" max="1000" step="1" />
+              </div>
+            </div>
+            <div class="row-actions spaced">
+              <button type="button" id="saveSettings" class="primary">保存规则</button>
+            </div>
+
+            <div class="hairline"></div>
+
+            <form id="passwordForm" class="split">
+              <div>
+                <label for="oldPassword">原管理密码</label>
+                <input id="oldPassword" type="password" autocomplete="current-password" />
+              </div>
+              <div>
+                <label for="newPassword">新管理密码</label>
+                <input id="newPassword" type="password" autocomplete="new-password" />
+              </div>
+              <div class="check-line">
+                <button type="submit">修改密码</button>
+              </div>
+            </form>
+            <p id="settingsStatus" class="status" role="status"></p>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <h3>生图 Key</h3>
+            </div>
+            <form id="keyForm">
+              <input id="keyId" type="hidden" />
+              <div class="split">
+                <div>
+                  <label for="keyName">名称</label>
+                  <input id="keyName" maxlength="40" required placeholder="例如：官方直连 1" />
+                </div>
+                <div>
+                  <label for="keyProtocol">类型</label>
+                  <select id="keyProtocol">
+                    <option value="gpt">GPT 生图</option>
+                    <option value="nano">Nano Banana 香蕉生图</option>
+                    <option value="gemini-official">GEMINI官方直连-带生图</option>
+                    <option value="gemini-batch">Gemini 批量生图</option>
+                  </select>
+                </div>
+              </div>
+              <label for="keyBase">中转地址</label>
+              <input id="keyBase" type="url" required spellcheck="false" value="https://uuapi.io/v1" />
+              <div class="row-actions tight">
+                <button type="button" class="small" data-origin="https://uuapi.io">uuapi.io</button>
+                <button type="button" class="small" data-origin="https://uuapi.cc">uuapi.cc</button>
+                <button type="button" class="small" data-origin="https://uuapi.net">uuapi.net</button>
+              </div>
+              <label for="keySecret">API Key</label>
+              <input id="keySecret" type="password" autocomplete="off" spellcheck="false" placeholder="新建时必填，编辑时留空表示不改" />
+              <label for="keyAgent">请求头 User-Agent</label>
+              <input id="keyAgent" maxlength="200" spellcheck="false" placeholder="留空则用 darkroom/1.0 (local image studio)" />
+              <div class="row-actions tight">
+                <button type="button" class="small" data-agent="claude-cli/2.0.76 (external, cli)">Claude CLI</button>
+                <button type="button" class="small" data-agent="codex_cli_rs/0.77.0 (Windows 10.0.26100; x86_64) WindowsTerminal">Codex CLI</button>
+                <button type="button" class="small" data-agent="">用默认</button>
+              </div>
+              <div class="split">
+                <div>
+                  <label for="keyBalance">剩余余额</label>
+                  <input id="keyBalance" type="number" step="0.0001" placeholder="留空表示尚未查询" />
+                </div>
+                <div class="check-line">
+                  <label><input id="keyEnabled" type="checkbox" checked /> 启用</label>
+                </div>
+              </div>
+              <label for="keyNote">备注</label>
+              <input id="keyNote" maxlength="200" />
+              <div class="row-actions spaced-lg">
+                <button type="submit" id="saveKey" class="primary">保存 Key</button>
+                <button type="button" id="resetKey">清空，改为新建</button>
+              </div>
+            </form>
+            <p id="keyStatus" class="status" role="status"></p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>类型</th>
+                    <th>剩余余额</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="keyRows"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <h3>用户</h3>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>用户</th>
+                    <th>额度</th>
+                    <th>上次签到</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="userRows"></tbody>
+              </table>
+            </div>
+            <p id="userStatus" class="status" role="status"></p>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <script src="./config.js"></script>
+    <script src="./admin.js"></script>
+  </body>
+</html>

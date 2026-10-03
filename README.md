@@ -4,7 +4,8 @@
 消耗额度生图；管理员在管理端维护中转站（UU API）的 Key 和余额，服务端按调用方式自动挑一把
 还有余额的 Key 去请求上游。
 
-前端是原生 HTML / CSS / JS，没有构建步骤，整个项目也没有第三方依赖。
+前端是原生 HTML / CSS / JS，没有构建步骤，整个项目也没有第三方依赖。页面风格沿用「飞天」那套
+纸底墨字的样式：Noto Serif SC 标题、青绿点缀、云纹分隔。
 
 ![生图工作台](docs/studio.png)
 
@@ -38,7 +39,7 @@
 需要 Node 18 或更高版本。
 
 ```bash
-node server.js          # 或者 npm start
+node server/server.js   # 或者 npm start
 ```
 
 然后打开 http://127.0.0.1:3780 。
@@ -50,7 +51,7 @@ node server.js          # 或者 npm start
 忘了密码时也能用它找回来：
 
 ```bash
-PORT=3780 ADMIN_USER=admin ADMIN_PASSWORD=your-password node server.js
+PORT=3780 ADMIN_USER=admin ADMIN_PASSWORD=your-password node server/server.js
 ```
 
 ## 上手顺序
@@ -186,18 +187,27 @@ PORT=3780 ADMIN_USER=admin ADMIN_PASSWORD=your-password node server.js
 
 ## 目录
 
+前后端是分开的两块，中间只有 `/api` 这一层约定：
+
 ```
-server.js            HTTP 服务、路由、上游调用与降级
-store.js             用户、会话、Key、额度的读写
-public/index.html    用户端页面
-public/app.js        用户端逻辑
-public/styles.css    用户端样式
-public/admin.html    管理端页面
-public/admin.js      管理端逻辑
-public/admin.css     管理端样式
-docs/                README 里的截图
-data/                运行时数据（已 gitignore）
+web/                前端（纯静态，没有构建步骤）
+  index.html          用户端
+  admin.html          管理端
+  styles.css          设计体系
+  app.js / admin.js   页面逻辑
+  config.js           后端地址（留空＝同源）
+server/             后端（Node，只用内置模块）
+  server.js           HTTP 服务、路由、上游调用与降级
+  store.js            用户、会话、Key、额度的读写
+docs/
+  API.md              接口契约
+  *.png               README 里的截图
+data/               运行时数据（已 gitignore）
 ```
+
+前端只依赖 `/api` 和 `/health`，不知道后端是什么写的。想换后端（比如用 Go + SQLite 重写一套），
+照着 `docs/API.md` 实现接口就行，`web/` 一个字节都不用动；也可以把 `web/` 丢给任何静态服务器，
+再用 `web/config.js` 把请求指到别的地址。
 
 ## 说明
 

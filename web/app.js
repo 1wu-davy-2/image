@@ -26,6 +26,12 @@ const HINTS = {
 
 const CHANNEL_LABEL = { async: "异步", sync: "同步", chat: "对话生图", gemini: "官方格式" };
 
+// 所有请求都从这里过，方便整体指向另一个后端。见 config.js。
+const API_BASE = String(window.DARKROOM_API || "").replace(/\/+$/, "");
+function api(path) {
+  return `${API_BASE}${path}`;
+}
+
 const form = document.querySelector("#form");
 const guestAuth = document.querySelector("#guestAuth");
 const userAuth = document.querySelector("#userAuth");
@@ -179,7 +185,7 @@ function renderAuth() {
 }
 
 async function refreshMe() {
-  const response = await fetch("/api/me");
+  const response = await fetch(api("/api/me"));
   const data = await response.json();
   me = data;
   checkinQuota = data.checkinQuota;
@@ -189,7 +195,7 @@ async function refreshMe() {
 }
 
 async function auth(path) {
-  const response = await fetch(path, {
+  const response = await fetch(api(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username: username.value.trim(), password: password.value }),
@@ -339,7 +345,7 @@ async function onSubmit(event) {
       if (maskFile.files[0]) payload.mask = await readFile(maskFile.files[0]);
       else if (maskUrl.value.trim()) payload.maskUrl = maskUrl.value.trim();
     }
-    const response = await fetch("/api/generate", {
+    const response = await fetch(api("/api/generate"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -384,7 +390,7 @@ password.addEventListener("keydown", (event) => {
   }
 });
 document.querySelector("#logoutBtn").addEventListener("click", async () => {
-  await fetch("/api/auth/logout", { method: "POST" });
+  await fetch(api("/api/auth/logout"), { method: "POST" });
   me = { user: null, checkinQuota, generateCost };
   renderAuth();
   loadBatches({ quiet: true });
@@ -395,7 +401,7 @@ document.querySelector("#passwordToggle").addEventListener("click", () => {
 });
 document.querySelector("#changePasswordBtn").addEventListener("click", async () => {
   try {
-    const response = await fetch("/api/me/password", {
+    const response = await fetch(api("/api/me/password"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -416,7 +422,7 @@ document.querySelector("#changePasswordBtn").addEventListener("click", async () 
 checkinBtn.addEventListener("click", async () => {
   checkinBtn.disabled = true;
   try {
-    const response = await fetch("/api/checkin", { method: "POST" });
+    const response = await fetch(api("/api/checkin"), { method: "POST" });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || "签到失败");
     me.user = data.user;
@@ -491,7 +497,7 @@ function renderBatches(result) {
       actions.append(
         batchButton("刷新", () => refreshBatch(id)),
         batchButton("下载", () => {
-          window.location.href = `/api/batches/${encodeURIComponent(id)}/download`;
+          window.location.href = api(`/api/batches/${encodeURIComponent(id)}/download`);
         }),
         batchButton("取消", () => cancelBatch(id)),
         batchButton("删除", () => deleteBatch(id)),
@@ -509,7 +515,7 @@ async function loadBatches({ quiet = false } = {}) {
     return;
   }
   try {
-    const response = await fetch("/api/batches");
+    const response = await fetch(api("/api/batches"));
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || `查不到批量任务（${response.status}）`);
     renderBatches(data.result);
@@ -522,7 +528,7 @@ async function loadBatches({ quiet = false } = {}) {
 
 async function batchAction(id, path, options, done) {
   try {
-    const response = await fetch(`/api/batches/${encodeURIComponent(id)}${path}`, options);
+    const response = await fetch(api(`/api/batches/${encodeURIComponent(id)}${path}`), options);
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || `请求失败（${response.status}）`);
     setBatchStatus(done(data));
@@ -565,7 +571,7 @@ async function submitBatch() {
   batchSubmit.disabled = true;
   setBatchStatus(`正在提交 ${prompts.length} 条…`);
   try {
-    const response = await fetch("/api/batches", {
+    const response = await fetch(api("/api/batches"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

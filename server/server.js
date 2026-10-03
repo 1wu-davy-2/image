@@ -6,7 +6,8 @@ const { pipeline } = require("node:stream/promises");
 const store = require("./store");
 
 const PORT = Number(process.env.PORT) || 3780;
-const PUBLIC_DIR = path.resolve(__dirname, "public");
+// 前端是纯静态文件，跟后端只靠 /api 通信，换后端时把这个目录丢给任何静态服务器都行。
+const PUBLIC_DIR = path.resolve(__dirname, "..", "web");
 const ALLOWED_HOSTS = new Set(["uuapi.io", "uuapi.net", "uuapi.shop", "uuapi.cc"]);
 // Images Edits takes files up to 20MB, and base64 inflates them by a third.
 const BODY_LIMIT = 32 * 1024 * 1024;

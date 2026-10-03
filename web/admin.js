@@ -5,6 +5,9 @@ const PROTOCOL_LABEL = {
   "gemini-batch": "批量",
 };
 
+// 所有请求都从这里过，方便整体指向另一个后端。见 config.js。
+const API_BASE = String(window.DARKROOM_API || "").replace(/\/+$/, "");
+
 const loginView = document.querySelector("#loginView");
 const appView = document.querySelector("#appView");
 const loginStatus = document.querySelector("#loginStatus");
@@ -22,7 +25,7 @@ function setStatus(el, message, isError) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   });
@@ -79,22 +82,26 @@ function render() {
     money.textContent = balanceText(key);
     if (key.balanceValid === false) {
       const invalid = document.createElement("div");
-      invalid.className = "bad";
+      invalid.className = "bad-text";
       invalid.textContent = "Key 已失效（is_active 为 false）";
       money.append(invalid);
     }
     if (key.balanceError) {
       const error = document.createElement("div");
-      error.className = "bad";
+      error.className = "bad-text";
       error.textContent = key.balanceError;
       money.append(error);
     }
     const enabled = document.createElement("td");
-    enabled.textContent = key.enabled ? "启用" : "停用";
+    const badge = document.createElement("span");
+    badge.className = key.enabled ? "badge" : "badge off";
+    badge.textContent = key.enabled ? "启用" : "停用";
+    enabled.append(badge);
     const actions = document.createElement("td");
     actions.className = "row-actions";
     const edit = document.createElement("button");
     edit.type = "button";
+    edit.className = "small";
     edit.textContent = "编辑";
     edit.addEventListener("click", () => {
       fillForm(key);
@@ -102,10 +109,12 @@ function render() {
     });
     const refresh = document.createElement("button");
     refresh.type = "button";
+    refresh.className = "small";
     refresh.textContent = "刷新余额";
     refresh.addEventListener("click", () => refreshBalance(key.id, refresh));
     const remove = document.createElement("button");
     remove.type = "button";
+    remove.className = "small";
     remove.textContent = "删除";
     remove.addEventListener("click", () => removeKey(key));
     actions.append(edit, refresh, remove);
@@ -134,24 +143,30 @@ function render() {
     const checkin = document.createElement("td");
     checkin.textContent = user.checkedInToday ? `${user.lastCheckinDate} · 今日已签` : (user.lastCheckinDate || "从未");
     const stateCell = document.createElement("td");
-    stateCell.textContent = user.disabled ? "已停用" : "正常";
-    if (user.disabled) stateCell.className = "bad";
+    const badge = document.createElement("span");
+    badge.className = user.disabled ? "badge off" : "badge";
+    badge.textContent = user.disabled ? "已停用" : "正常";
+    stateCell.append(badge);
     const actions = document.createElement("td");
     actions.className = "row-actions";
     const save = document.createElement("button");
     save.type = "button";
+    save.className = "small";
     save.textContent = "保存额度";
     save.addEventListener("click", () => saveQuota(user, input, save));
     const reset = document.createElement("button");
     reset.type = "button";
+    reset.className = "small";
     reset.textContent = "重置密码";
     reset.addEventListener("click", () => resetPassword(user));
     const toggle = document.createElement("button");
     toggle.type = "button";
+    toggle.className = "small";
     toggle.textContent = user.disabled ? "启用" : "停用";
     toggle.addEventListener("click", () => toggleDisabled(user, toggle));
     const remove = document.createElement("button");
     remove.type = "button";
+    remove.className = "small danger";
     remove.textContent = "删除";
     remove.addEventListener("click", () => removeUser(user));
     actions.append(save, reset, toggle, remove);
