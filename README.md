@@ -69,7 +69,7 @@ PORT=3780 ADMIN_USER=admin ADMIN_PASSWORD=your-password node server/server.js
 
 ### 跑 Go 那套
 
-需要 Go 1.22 或更高版本（用到了 `net/http` 的方法路由）。
+需要 Go 1.26 或更高版本——路由本身 1.22 就够，但 `modernc.org/sqlite` 那一串依赖要求 1.26。
 
 ```bash
 cd server-go
