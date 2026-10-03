@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>暗房 · 生图</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%23e39a58'/%3E%3C/svg%3E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,560;9..144,640&family=Outfit:wght@380;500;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <p class="eyebrow">UU API · Image</p>
+          <h1>暗房</h1>
+        </div>
+      </div>
+      <div class="lede-wrap">
+        <p class="lede">登录后每天可以签到领取额度。GPT 和 Gemini 的生图 Key 在管理端维护。</p>
+        <a class="admin-link" href="/admin">管理端</a>
+      </div>
+    </header>
+
+    <main class="layout">
+      <form id="form" class="panel">
+        <fieldset>
+          <legend>账号</legend>
+          <div id="guestAuth">
+            <div class="auth-grid">
+              <div>
+                <label for="username">用户名</label>
+                <input id="username" name="username" autocomplete="username" maxlength="20" />
+              </div>
+              <div>
+                <label for="password">密码</label>
+                <input id="password" name="password" type="password" autocomplete="current-password" />
+              </div>
+            </div>
+            <div class="account-actions">
+              <button type="button" id="loginBtn">登录</button>
+              <button type="button" id="registerBtn">注册</button>
+            </div>
+          </div>
+          <div id="userAuth" class="hidden">
+            <div class="quota-line">
+              <div>
+                <span id="hello"></span>
+                <strong id="quota">0</strong>
+                <span class="hint-inline">额度</span>
+              </div>
+              <div class="account-actions">
+                <button type="button" id="checkinBtn">签到领额度</button>
+                <button type="button" id="logoutBtn">退出</button>
+              </div>
+            </div>
+            <p id="checkinHint" class="hint"></p>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>画面</legend>
+          <div class="mode" role="radiogroup" aria-label="生成方式">
+            <label><input type="radio" name="mode" value="generate" checked /> 文生图</label>
+            <label><input type="radio" name="mode" value="edit" /> 图生图</label>
+          </div>
+
+          <label for="protocol">调用方式</label>
+          <select id="protocol" name="protocol">
+            <option value="gpt">GPT 生图</option>
+            <option value="nano">Nano Banana 香蕉生图</option>
+            <option value="gemini-official">GEMINI官方直连-带生图</option>
+          </select>
+          <p id="protocolHint" class="hint"></p>
+
+          <label for="model">模型</label>
+          <select id="model" name="model"></select>
+          <input id="customModel" name="customModel" class="hidden" placeholder="填写模型名" spellcheck="false" />
+
+          <label for="prompt">描述</label>
+          <textarea id="prompt" name="prompt" rows="6" required placeholder="冬夜里的灯塔，海面翻着白浪，胶片颗粒，窗口是暖色的。"></textarea>
+
+          <div id="editFields" class="hidden">
+            <label for="imageFile">参考图</label>
+            <input id="imageFile" name="imageFile" type="file" accept="image/png,image/jpeg,image/webp" />
+            <label for="imageUrl">或图片 URL</label>
+            <input id="imageUrl" name="imageUrl" type="url" placeholder="https://example.com/reference.png" />
+          </div>
+
+          <div id="pixelSize" class="split">
+            <div>
+              <label for="size">尺寸</label>
+              <select id="size" name="size">
+                <option value="1024x1024">1:1 · 1024×1024</option>
+                <option value="1024x1536">2:3 · 1024×1536</option>
+                <option value="1536x1024">3:2 · 1536×1024</option>
+                <option value="1024x1792">9:16 · 1024×1792</option>
+                <option value="1792x1024">16:9 · 1792×1024</option>
+                <option value="2048x2048">1:1 · 2048×2048</option>
+                <option value="custom">自定义</option>
+              </select>
+            </div>
+            <div>
+              <label for="quality">质量</label>
+              <select id="quality" name="quality">
+                <option value="medium" selected>medium</option>
+                <option value="high">high</option>
+                <option value="auto">auto</option>
+              </select>
+            </div>
+          </div>
+          <div id="geminiSize" class="split hidden">
+            <div>
+              <label for="aspectRatio">画幅</label>
+              <select id="aspectRatio" name="aspectRatio">
+                <option value="1:1">1:1</option>
+                <option value="3:2">3:2</option>
+                <option value="2:3">2:3</option>
+                <option value="4:3">4:3</option>
+                <option value="3:4">3:4</option>
+                <option value="16:9">16:9</option>
+                <option value="9:16">9:16</option>
+              </select>
+            </div>
+            <div>
+              <label for="imageSize">分辨率</label>
+              <select id="imageSize" name="imageSize">
+                <option value="1K">1K</option>
+                <option value="2K">2K</option>
+                <option value="4K">4K</option>
+              </select>
+            </div>
+          </div>
+          <div id="customSize" class="split hidden">
+            <div>
+              <label for="width">宽</label>
+              <input id="width" name="width" type="number" min="256" max="8192" step="1" value="1024" />
+            </div>
+            <div>
+              <label for="height">高</label>
+              <input id="height" name="height" type="number" min="256" max="8192" step="1" value="1024" />
+            </div>
+          </div>
+        </fieldset>
+
+        <button id="submit" type="submit">生成</button>
+        <p id="status" class="status" role="status" aria-live="polite"></p>
+
+        <details class="docs">
+          <summary>中转站怎么调用</summary>
+          <div class="docs-body">
+            <p>用户每天签到领取额度，生图时扣额度。GPT、Nano Banana、Gemini 官方直连的 Key 和剩余余额在 <a href="/admin">管理端</a> 维护。服务端用还有余额的 Key 去请求中转站。</p>
+            <p><strong>GPT 生图</strong>：<code>POST /v1/images/generations</code>，编辑是 <code>/v1/images/edits</code>。先走异步再轮询 <code>/v1/images/tasks/{task_id}</code>，异步不存在时改同步。字段有 <code>model</code>、<code>prompt</code>、<code>size</code>、<code>quality</code>。示例模型 <code>gpt-image-2.5-flare</code>、<code>gpt-image-1</code>。</p>
+            <p><strong>Nano Banana</strong>：同一套生图接口，模型用 <code>gemini-2.5-flash-image</code>（香蕉）、<code>gemini-3-pro-image</code>、<code>gemini-3.1-flash-image</code>。生图接口不收这个模型时，改走 <code>POST /v1/chat/completions</code>，和 UU 控制台对 Gemini 分组的做法一致。</p>
+            <p><strong>GEMINI官方直连-带生图</strong>：<code>POST /v1beta/models/{模型}:generateContent</code>。正文是 Gemini 官方格式，<code>generationConfig.responseModalities</code> 含 <code>IMAGE</code>，画幅和分辨率放在 <code>imageConfig</code>。参考图以 <code>inlineData</code> 放进 <code>contents</code>。</p>
+          </div>
+        </details>
+      </form>
+
+      <section class="stage" aria-label="生成结果">
+        <div class="frame">
+          <div id="canvas" class="canvas">
+            <p class="empty">描述画面，然后生成。</p>
+          </div>
+        </div>
+        <div id="meta" class="meta"></div>
+        <div id="actions" class="actions hidden"></div>
+        <h2>最近</h2>
+        <div id="history" class="history" aria-live="polite"></div>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

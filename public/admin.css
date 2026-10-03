@@ -1,0 +1,38 @@
+.admin { max-width: 980px; margin: 0 auto; padding: 8px 24px 48px; display: grid; gap: 18px; }
+.admin h2 { margin: 0; font-size: 13px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+.narrow { max-width: 420px; margin: 24px auto; padding: 18px; }
+.admin button[type="submit"], #saveSettings {
+  border: 0;
+  border-radius: 12px;
+  background: var(--copper);
+  color: var(--copper-ink);
+  font-weight: 600;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+.admin button[type="submit"]:disabled, #saveSettings:disabled { opacity: 0.55; }
+.section-head, .row-actions { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.password-form { margin-top: 16px; align-items: end; }
+.password-form button, .check-line { margin-top: 22px; }
+.check-line label { display: flex; align-items: center; gap: 8px; }
+.check-line input { width: auto; }
+.table-wrap { overflow-x: auto; margin-top: 14px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; font-size: 14px; }
+th { color: var(--muted); font-weight: 500; }
+.money { font-variant-numeric: tabular-nums; }
+.bad { color: var(--danger); }
+.row-actions button, .user-save {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.row-actions button:hover, .user-save:hover { color: var(--ink); border-color: var(--copper); }
+.user-quota { width: 88px; }
+@media (max-width: 860px) {
+  .password-form { display: block; }
+  .password-form button, .check-line { margin-top: 8px; }
+}

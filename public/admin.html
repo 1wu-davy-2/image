@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>暗房 · 管理端</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%23e39a58'/%3E%3C/svg%3E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,560;9..144,640&family=Outfit:wght@380;500;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/admin.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <p class="eyebrow">Admin</p>
+          <h1>管理端</h1>
+        </div>
+      </div>
+      <div class="lede-wrap">
+        <p class="lede">维护 GPT 与 Gemini 的生图 Key，以及每把 Key 的剩余余额。</p>
+        <a class="admin-link" href="/">返回用户端</a>
+      </div>
+    </header>
+
+    <main class="admin">
+      <form id="loginView" class="panel narrow">
+        <label for="adminPassword">管理密码</label>
+        <input id="adminPassword" type="password" autocomplete="current-password" required />
+        <button type="submit">进入</button>
+        <p id="loginStatus" class="status" role="status"></p>
+      </form>
+
+      <div id="appView" class="hidden">
+        <section class="panel">
+          <div class="section-head">
+            <h2>签到规则</h2>
+            <button type="button" id="logoutBtn">退出</button>
+          </div>
+          <div class="split">
+            <div>
+              <label for="checkinQuota">每日签到领取额度</label>
+              <input id="checkinQuota" type="number" min="0" max="1000" step="1" />
+            </div>
+            <div>
+              <label for="generateCost">每次生图消耗额度</label>
+              <input id="generateCost" type="number" min="0" max="1000" step="1" />
+            </div>
+          </div>
+          <div class="account-actions">
+            <button type="button" id="saveSettings">保存规则</button>
+          </div>
+          <form id="passwordForm" class="split password-form">
+            <div>
+              <label for="oldPassword">原管理密码</label>
+              <input id="oldPassword" type="password" autocomplete="current-password" />
+            </div>
+            <div>
+              <label for="newPassword">新管理密码</label>
+              <input id="newPassword" type="password" autocomplete="new-password" />
+            </div>
+            <button type="submit">修改密码</button>
+          </form>
+          <p id="settingsStatus" class="status" role="status"></p>
+        </section>
+
+        <section class="panel">
+          <h2>生图 Key</h2>
+          <form id="keyForm">
+            <input id="keyId" type="hidden" />
+            <div class="split">
+              <div>
+                <label for="keyName">名称</label>
+                <input id="keyName" maxlength="40" required placeholder="例如：官方直连 1" />
+              </div>
+              <div>
+                <label for="keyProtocol">类型</label>
+                <select id="keyProtocol">
+                  <option value="gpt">GPT 生图</option>
+                  <option value="nano">Nano Banana 香蕉生图</option>
+                  <option value="gemini-official">GEMINI官方直连-带生图</option>
+                </select>
+              </div>
+            </div>
+            <label for="keyBase">中转地址</label>
+            <input id="keyBase" type="url" required spellcheck="false" value="https://uuapi.io/v1" />
+            <div class="presets">
+              <button type="button" data-origin="https://uuapi.io">uuapi.io</button>
+              <button type="button" data-origin="https://uuapi.cc">uuapi.cc</button>
+              <button type="button" data-origin="https://uuapi.net">uuapi.net</button>
+            </div>
+            <label for="keySecret">API Key</label>
+            <input id="keySecret" type="password" autocomplete="off" spellcheck="false" placeholder="新建时必填，编辑时留空表示不改" />
+            <div class="split">
+              <div>
+                <label for="keyBalance">剩余余额</label>
+                <input id="keyBalance" type="number" step="0.0001" placeholder="留空表示尚未查询" />
+              </div>
+              <div class="check-line">
+                <label><input id="keyEnabled" type="checkbox" checked /> 启用</label>
+              </div>
+            </div>
+            <label for="keyNote">备注</label>
+            <input id="keyNote" maxlength="200" />
+            <div class="account-actions">
+              <button type="submit" id="saveKey">保存 Key</button>
+              <button type="button" id="resetKey">清空，改为新建</button>
+            </div>
+          </form>
+          <p id="keyStatus" class="status" role="status"></p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>类型</th>
+                  <th>剩余余额</th>
+                  <th>状态</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="keyRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>用户额度</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>用户</th>
+                  <th>额度</th>
+                  <th>上次签到</th>
+                  <th>调整</th>
+                </tr>
+              </thead>
+              <tbody id="userRows"></tbody>
+            </table>
+          </div>
+          <p id="userStatus" class="status" role="status"></p>
+        </section>
+      </div>
+    </main>
+    <script src="/admin.js"></script>
+  </body>
+</html>

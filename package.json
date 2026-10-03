@@ -1,0 +1,8 @@
+{
+  "name": "gpt-image-studio",
+  "private": true,
+  "description": "Local page for GPT image models through the UU API relay",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
