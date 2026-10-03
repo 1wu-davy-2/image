@@ -26,6 +26,8 @@ function setStatus(el, message, isError) {
 
 async function api(path, options = {}) {
   const response = await fetch(`${API_BASE}${path}`, {
+    // 跨源时必须显式带上，否则 Cookie 既不发送，Set-Cookie 也会被丢掉。
+    credentials: "include",
     ...options,
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   });

@@ -901,8 +901,35 @@ function resolvePublic(urlPath) {
   return file;
 }
 
+// 前端在 6664、后端在 6670，属于跨源。登录态是 HttpOnly Cookie，
+// 所以必须回具体来源 + Allow-Credentials，不能用 *。
+const CORS_ORIGINS = new Set(
+  (process.env.CORS_ORIGINS || "http://127.0.0.1:6664,http://localhost:6664")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean),
+);
+
 const server = http.createServer(async (req, res) => {
   try {
+    const origin = req.headers.origin;
+    if (origin && CORS_ORIGINS.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Vary", "Origin");
+    }
+    // 预检请求不带 Cookie，也不能要求登录，直接放行。
+    if (req.method === "OPTIONS") {
+      if (origin && CORS_ORIGINS.has(origin)) {
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+        res.setHeader("Access-Control-Max-Age", "600");
+      }
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
     if (url.pathname === "/admin" || url.pathname === "/admin/") url.pathname = "/admin.html";
 

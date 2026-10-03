@@ -3,6 +3,8 @@
   "private": true,
   "description": "Local page for GPT image models through the UU API relay",
   "scripts": {
+    "web": "node web-server.js",
+    "api": "node server/server.js",
     "start": "node server/server.js"
   }
 }

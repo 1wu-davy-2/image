@@ -13,6 +13,10 @@
   前端直接把 `error` 显示给用户，所以文案要是能看懂的中文。
 - 需要登录的接口在未登录时返回 `401`；额度不够返回 `402`；被停用的账号返回 `403`。
 - 前端通过 `web/config.js` 里的 `window.DARKROOM_API` 决定请求哪个源，留空表示同源。
+- 前后端分开跑时（前端 6664、后端 6670）属于跨源，后端必须回 CORS 头：
+  `Access-Control-Allow-Origin` 回具体来源（**不能是 `*`**）、`Access-Control-Allow-Credentials: true`，
+  并且要正确响应 `OPTIONS` 预检（预检不带 Cookie，不能要求登录）。
+  放行名单默认是 `http://127.0.0.1:6664` 和 `http://localhost:6664`。
 
 ## 数据模型
 

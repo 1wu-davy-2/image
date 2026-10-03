@@ -47,7 +47,7 @@ type server struct {
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "3781"
+		port = "6670"
 	}
 	dataPath := os.Getenv("DATA_FILE")
 	if dataPath == "" {
@@ -144,8 +144,50 @@ func (s *server) routes() http.Handler {
 				writeJSON(w, 500, map[string]any{"ok": false, "error": "服务器内部错误"})
 			}
 		}()
+
+		// 前端在 6664、后端在 6670，属于跨源。登录态是 HttpOnly Cookie，
+		// 所以这里必须回具体来源 + Allow-Credentials，不能用 *。
+		origin := r.Header.Get("Origin")
+		allowed := origin != "" && corsOrigins[origin]
+		if allowed {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Add("Vary", "Origin")
+		}
+		// 预检请求不带 Cookie，也不能要求登录，直接放行。
+		if r.Method == http.MethodOptions {
+			if allowed {
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+				w.Header().Set("Access-Control-Max-Age", "600")
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
 		mux.ServeHTTP(w, r)
 	})
+}
+
+// CORS_ORIGINS 覆盖放行名单（逗号分隔）。默认只放行本地前端那个端口。
+var corsOrigins = loadCORSOrigins()
+
+func loadCORSOrigins() map[string]bool {
+	raw := strings.TrimSpace(os.Getenv("CORS_ORIGINS"))
+	origins := []string{"http://127.0.0.1:6664", "http://localhost:6664"}
+	if raw != "" {
+		origins = nil
+		for _, part := range strings.Split(raw, ",") {
+			if origin := strings.TrimSpace(part); origin != "" {
+				origins = append(origins, origin)
+			}
+		}
+	}
+	out := make(map[string]bool, len(origins))
+	for _, origin := range origins {
+		out[origin] = true
+	}
+	return out
 }
 
 type handlerFunc func(http.ResponseWriter, *http.Request) error

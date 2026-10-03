@@ -185,7 +185,7 @@ function renderAuth() {
 }
 
 async function refreshMe() {
-  const response = await fetch(api("/api/me"));
+  const response = await fetch(api("/api/me"), { credentials: "include" });
   const data = await response.json();
   me = data;
   checkinQuota = data.checkinQuota;
@@ -196,6 +196,7 @@ async function refreshMe() {
 
 async function auth(path) {
   const response = await fetch(api(path), {
+    credentials: "include",
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username: username.value.trim(), password: password.value }),
@@ -346,6 +347,7 @@ async function onSubmit(event) {
       else if (maskUrl.value.trim()) payload.maskUrl = maskUrl.value.trim();
     }
     const response = await fetch(api("/api/generate"), {
+    credentials: "include",
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -390,7 +392,7 @@ password.addEventListener("keydown", (event) => {
   }
 });
 document.querySelector("#logoutBtn").addEventListener("click", async () => {
-  await fetch(api("/api/auth/logout"), { method: "POST" });
+  await fetch(api("/api/auth/logout"), { method: "POST", credentials: "include" });
   me = { user: null, checkinQuota, generateCost };
   renderAuth();
   loadBatches({ quiet: true });
@@ -402,6 +404,7 @@ document.querySelector("#passwordToggle").addEventListener("click", () => {
 document.querySelector("#changePasswordBtn").addEventListener("click", async () => {
   try {
     const response = await fetch(api("/api/me/password"), {
+    credentials: "include",
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -422,7 +425,7 @@ document.querySelector("#changePasswordBtn").addEventListener("click", async () 
 checkinBtn.addEventListener("click", async () => {
   checkinBtn.disabled = true;
   try {
-    const response = await fetch(api("/api/checkin"), { method: "POST" });
+    const response = await fetch(api("/api/checkin"), { method: "POST", credentials: "include" });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || "签到失败");
     me.user = data.user;
@@ -515,7 +518,7 @@ async function loadBatches({ quiet = false } = {}) {
     return;
   }
   try {
-    const response = await fetch(api("/api/batches"));
+    const response = await fetch(api("/api/batches"), { credentials: "include" });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || `查不到批量任务（${response.status}）`);
     renderBatches(data.result);
@@ -528,7 +531,7 @@ async function loadBatches({ quiet = false } = {}) {
 
 async function batchAction(id, path, options, done) {
   try {
-    const response = await fetch(api(`/api/batches/${encodeURIComponent(id)}${path}`), options);
+    const response = await fetch(api(`/api/batches/${encodeURIComponent(id)}${path}`), { credentials: "include", ...options });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || `请求失败（${response.status}）`);
     setBatchStatus(done(data));
@@ -572,6 +575,7 @@ async function submitBatch() {
   setBatchStatus(`正在提交 ${prompts.length} 条…`);
   try {
     const response = await fetch(api("/api/batches"), {
+    credentials: "include",
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

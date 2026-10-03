@@ -36,23 +36,30 @@
 
 ## 快速开始
 
-需要 Node 18 或更高版本。
+需要 Node 18 或更高版本（前端那个静态服务用的就是它）。
+
+前端和后端是两个独立的进程，分别起：
 
 ```bash
-node server/server.js   # 或者 npm start
+node web-server.js                # 前端静态服务，127.0.0.1:6664
+cd server-go && go run .          # 后端，127.0.0.1:6670
 ```
 
-然后打开 http://127.0.0.1:3780 。
+然后打开 **http://127.0.0.1:6664** 。
 
-管理端默认账号是 **`admin` / `admin@123`**，服务只监听 `127.0.0.1`，不对外网开放。
+管理端默认账号是 **`admin` / `admin@123`**，两个服务都只监听 `127.0.0.1`，不对外网开放。
 登录后请到管理端把密码改掉。
 
 想换账号密码就用环境变量，设了 `ADMIN_PASSWORD` 之后每次启动都会把管理端对齐到这个密码，
 忘了密码时也能用它找回来：
 
 ```bash
-PORT=3780 ADMIN_USER=admin ADMIN_PASSWORD=your-password node server/server.js
+ADMIN_USER=admin ADMIN_PASSWORD=your-password go run .
 ```
+
+> **别用 6665–6669 这几个端口。** 那是 IRC 的保留段，Chrome 和 Edge 会直接拒绝连接
+> （`ERR_UNSAFE_PORT`），curl 却一切正常，很容易查半天。前端默认 6664、后端默认 6670
+> 就是为了避开这一段。
 
 ## 两个后端
 
@@ -62,10 +69,24 @@ PORT=3780 ADMIN_USER=admin ADMIN_PASSWORD=your-password node server/server.js
 | --- | --- | --- |
 | 依赖 | 无，只用 Node 内置模块 | `modernc.org/sqlite`（纯 Go，不需要 CGO 和 gcc）、`golang.org/x/crypto` |
 | 存储 | `data/store.json` | `data/darkroom.db`（SQLite） |
-| 默认端口 | 3780 | 3781 |
+| 默认端口 | 3780 | 6670 |
 | 启动 | `node server/server.js` | `cd server-go && go run .` |
+| 同时托管前端 | 会（同源） | 会（同源，但默认走跨源那套） |
 
 两套各自独立：数据文件不同、会话不互通，可以同时开着对比着用。
+
+### 前后端分开跑
+
+默认就是这么跑的：前端在 6664，后端在 6670，属于跨源。所以
+
+- `web/config.js` 里把请求指向 `http://<当前主机名>:6670`；
+- 后端必须回 CORS 头，而且因为登录态是 HttpOnly Cookie，`Access-Control-Allow-Origin`
+  只能回具体来源、不能是 `*`，还要带 `Access-Control-Allow-Credentials`。
+  两套后端都实现了，放行名单默认是 `http://127.0.0.1:6664` 和 `http://localhost:6664`，
+  用 `CORS_ORIGINS` 可以改（逗号分隔）。
+
+想把前后端合成同源（比如直接用后端托管 `web/`），把 `web/config.js` 里的
+`window.DARKROOM_API` 改成空串即可，两个后端都会照常提供静态文件。
 
 ### 跑 Go 那套
 
@@ -76,13 +97,15 @@ cd server-go
 go run .          # 或者 go build -o darkroom.exe . && ./darkroom.exe
 ```
 
-默认起在 3781，读写 `../data/darkroom.db`，管理端账号密码的默认值和 Node 版一致
+默认起在 6670，读写 `../data/darkroom.db`，管理端账号密码的默认值和 Node 版一致
 （`admin` / `admin@123`，同样认 `ADMIN_USER` / `ADMIN_PASSWORD`）。
 
 Go 版比 Node 版多几个环境变量：
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
+| `PORT` | `6670` | 监听端口 |
+| `CORS_ORIGINS` | `http://127.0.0.1:6664,http://localhost:6664` | 放行哪些来源跨源访问 |
 | `DATA_FILE` | `../data/darkroom.db` | SQLite 文件路径 |
 | `WEB_DIR` | `../web` | 前端目录 |
 | `RELAY_HOSTS` | uuapi 那四个域名 | 中转域名白名单，逗号分隔。只有自建中转或本地起桩测试才需要改；放开它等于允许把请求发到任意主机 |
@@ -224,12 +247,13 @@ Go 版比 Node 版多几个环境变量：
 前后端是分开的两块，中间只有 `/api` 这一层约定：
 
 ```
+web-server.js       前端静态服务（只发 web/，不碰数据）
 web/                前端（纯静态，没有构建步骤）
   index.html          用户端
   admin.html          管理端
   styles.css          设计体系
   app.js / admin.js   页面逻辑
-  config.js           后端地址（留空＝同源）
+  config.js           后端地址
 server/             后端（Node，只用内置模块）
   server.js           HTTP 服务、路由、上游调用与降级
   store.js            用户、会话、Key、额度的读写

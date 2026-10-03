@@ -1,10 +1,14 @@
 // 前端与后端唯一的接头处。
 //
-// 留空表示跟页面同源 —— 由 server/server.js 同时提供静态文件和 /api。
-// 把前端挂到别的后端（比如以后用 Go 重写的那套）时，改成那个后端的地址：
+// 前端跑在 6664（node web-server.js），后端跑在 6670（Go），两者不同源。
+// 这里按当前页面的主机名拼出后端地址，这样用 127.0.0.1 或 localhost 打开都对得上
+// —— 两者在浏览器眼里是不同站点，写死其中一个会让另一个的 Cookie 发不出去。
 //
-//   window.DARKROOM_API = "http://127.0.0.1:8080";
+// 想换后端端口就改下面的 6670；想改成前后端同源（比如由后端直接托管 web/），
+// 把整个表达式换成空串即可：
 //
-// 跨源的话后端要允许携带 Cookie（CORS 的 Access-Control-Allow-Credentials），
-// 因为登录态是 HttpOnly Cookie。
-window.DARKROOM_API = "";
+//   window.DARKROOM_API = "";
+//
+// 跨源时后端必须回 Access-Control-Allow-Origin（不能是 *）和
+// Access-Control-Allow-Credentials，因为登录态是 HttpOnly Cookie。
+window.DARKROOM_API = `${location.protocol}//${location.hostname}:6670`;
