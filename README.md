@@ -54,6 +54,40 @@ node server/server.js   # 或者 npm start
 PORT=3780 ADMIN_USER=admin ADMIN_PASSWORD=your-password node server/server.js
 ```
 
+## 两个后端
+
+`web/` 是纯静态前端，只认 `/api` 和 `/health`，所以后端有两套实现可以互换，前端一行都不用改：
+
+|  | `server/`（Node） | `server-go/`（Go） |
+| --- | --- | --- |
+| 依赖 | 无，只用 Node 内置模块 | `modernc.org/sqlite`（纯 Go，不需要 CGO 和 gcc）、`golang.org/x/crypto` |
+| 存储 | `data/store.json` | `data/darkroom.db`（SQLite） |
+| 默认端口 | 3780 | 3781 |
+| 启动 | `node server/server.js` | `cd server-go && go run .` |
+
+两套各自独立：数据文件不同、会话不互通，可以同时开着对比着用。
+
+### 跑 Go 那套
+
+需要 Go 1.22 或更高版本（用到了 `net/http` 的方法路由）。
+
+```bash
+cd server-go
+go run .          # 或者 go build -o darkroom.exe . && ./darkroom.exe
+```
+
+默认起在 3781，读写 `../data/darkroom.db`，管理端账号密码的默认值和 Node 版一致
+（`admin` / `admin@123`，同样认 `ADMIN_USER` / `ADMIN_PASSWORD`）。
+
+Go 版比 Node 版多几个环境变量：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DATA_FILE` | `../data/darkroom.db` | SQLite 文件路径 |
+| `WEB_DIR` | `../web` | 前端目录 |
+| `RELAY_HOSTS` | uuapi 那四个域名 | 中转域名白名单，逗号分隔。只有自建中转或本地起桩测试才需要改；放开它等于允许把请求发到任意主机 |
+| `RELAY_CA_FILE` | 无 | 额外信任的 CA 证书（PEM），用来接自签证书的中转站 |
+
 ## 上手顺序
 
 1. 打开 http://127.0.0.1:3780/admin ，用 `admin` / `admin@123` 进入管理端。
@@ -199,14 +233,18 @@ web/                前端（纯静态，没有构建步骤）
 server/             后端（Node，只用内置模块）
   server.js           HTTP 服务、路由、上游调用与降级
   store.js            用户、会话、Key、额度的读写
+server-go/          后端（Go + SQLite，另一套实现）
+  main.go             HTTP 服务、路由、参数校验
+  store.go            建表与用户、会话、Key、额度的读写
+  relay.go            上游调用与降级
 docs/
   API.md              接口契约
   *.png               README 里的截图
 data/               运行时数据（已 gitignore）
 ```
 
-前端只依赖 `/api` 和 `/health`，不知道后端是什么写的。想换后端（比如用 Go + SQLite 重写一套），
-照着 `docs/API.md` 实现接口就行，`web/` 一个字节都不用动；也可以把 `web/` 丢给任何静态服务器，
+前端只依赖 `/api` 和 `/health`，不知道后端是什么写的。再写第三套后端也行：照着 `docs/API.md`
+实现接口即可，`web/` 一个字节都不用动；也可以把 `web/` 丢给任何静态服务器，
 再用 `web/config.js` 把请求指到别的地址。
 
 ## 说明
