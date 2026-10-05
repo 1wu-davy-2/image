@@ -1,10 +1,10 @@
 # 暗房 · GPT / Gemini 生图工作台
 
-一个跑在本机的生图工作台。Node 起一个服务，浏览器打开就能用：用户注册登录、每天签到领额度、
+一个跑在本机的生图工作台。后端是 Go 起的一个服务，浏览器打开就能用：用户注册登录、每天签到领额度、
 消耗额度生图；管理员在管理端维护中转站（UU API）的 Key 和余额，服务端按调用方式自动挑一把
 还有余额的 Key 去请求上游。
 
-前端是原生 HTML / CSS / JS，没有构建步骤，整个项目也没有第三方依赖。页面风格沿用「飞天」那套
+前端是原生 HTML / CSS / JS，没有构建步骤、没有第三方依赖。页面风格沿用「飞天」那套
 纸底墨字的样式：Noto Serif SC 标题、青绿点缀、云纹分隔。
 
 ![生图工作台](docs/studio.png)
@@ -32,20 +32,26 @@
 - Key 池：按调用方式分组，优先挑余额多的、最近没怎么用过的 Key；余额为 0、停用的、
   以及中转站报告已失效的 Key 都不会被选中。
 - 每把 Key 可以单独配请求头 `User-Agent`，应付中转站的外接策略。
-- 生成记录留在浏览器 localStorage 里（最近 16 条），服务端不存图片。
+- 生成记录存在服务端的 `generations` 表里，图片一并存成 BLOB，所以在「作品集」里翻得到，
+  上游链接过期也不影响。可以挑几张设成公开，出现在「公开作品」里。
 
 ## 快速开始
 
-需要 Node 18 或更高版本（前端那个静态服务用的就是它）。
+前端要 Node 18 或更高版本（静态服务用的就是它），后端要 Go 1.26 或更高版本。
 
-前端和后端是两个独立的进程，分别起：
+前端和后端是两个独立的进程，分别起。这里用 16666 / 18888，和 `web/config.js` 里写死的后端
+端口对上（代码里的默认值其实是 6664 / 6670，不改 `config.js` 的话就得按默认值跑）：
 
 ```bash
-node web-server.js                # 前端静态服务，127.0.0.1:6664
-cd server-go && go run .          # 后端，127.0.0.1:6670
+PORT=16666 node web-server.js      # 前端静态服务，127.0.0.1:16666
+
+cd server-go
+PORT=18888 \
+CORS_ORIGINS=http://127.0.0.1:16666,http://localhost:16666 \
+go run .                           # 后端，127.0.0.1:18888
 ```
 
-然后打开 **http://127.0.0.1:6664** 。
+然后打开 **http://127.0.0.1:16666** 。
 
 管理端默认账号是 **`admin` / `admin@123`**，两个服务都只监听 `127.0.0.1`，不对外网开放。
 登录后请到管理端把密码改掉。
@@ -61,46 +67,53 @@ ADMIN_USER=admin ADMIN_PASSWORD=your-password go run .
 > （`ERR_UNSAFE_PORT`），curl 却一切正常，很容易查半天。前端默认 6664、后端默认 6670
 > 就是为了避开这一段。
 
-## 两个后端
+## 工作台
 
-`web/` 是纯静态前端，只认 `/api` 和 `/health`，所以后端有两套实现可以互换，前端一行都不用改：
+登录之后是五页，左边一条菜单栏，右上角是用户菜单（显示中文名，没填就显示名称）：
 
-|  | `server/`（Node） | `server-go/`（Go） |
-| --- | --- | --- |
-| 依赖 | 无，只用 Node 内置模块 | `modernc.org/sqlite`（纯 Go，不需要 CGO 和 gcc）、`golang.org/x/crypto` |
-| 存储 | `data/store.json` | `data/darkroom.db`（SQLite） |
-| 默认端口 | 3780 | 6670 |
-| 启动 | `node server/server.js` | `cd server-go && go run .` |
-| 同时托管前端 | 会（同源） | 会（同源，但默认走跨源那套） |
+| 页面 | 干什么 |
+| --- | --- |
+| 首页 · 签到 | 看额度、签到领额度、账号信息，外加最近几张作品 |
+| 公开作品 | 所有人公开出来的图。不登录也能看 |
+| 创作 | 生图表单和批量生图。生成的图自动收进作品集 |
+| 作品集 | 自己生成过的图，可以设成公开或删掉 |
+| 系统设置 | 改中文名、改密码、退出 |
 
-两套各自独立：数据文件不同、会话不互通，可以同时开着对比着用。
+作品集里的图由服务端存着（`generations` + `generation_images` 两张表，图片存 BLOB），
+上游链接过期也不影响。只有设成公开的才出现在「公开作品」里。
 
-### 前后端分开跑
+菜单栏底部和用户菜单里的「管理端」**只有管理员看得见**，普通用户那边根本不渲染。
+判断依据是用户表上的 `is_admin` 标志，不是「名字叫 admin」——管理员没登过用户端时，
+`admin` 这个名字是能被普通用户抢注的，靠名字判断会认错人。
 
-默认就是这么跑的：前端在 6664，后端在 6670，属于跨源。所以
+## 后端
 
-- `web/config.js` 里把请求指向 `http://<当前主机名>:6670`；
-- 后端必须回 CORS 头，而且因为登录态是 HttpOnly Cookie，`Access-Control-Allow-Origin`
-  只能回具体来源、不能是 `*`，还要带 `Access-Control-Allow-Credentials`。
-  两套后端都实现了，放行名单默认是 `http://127.0.0.1:6664` 和 `http://localhost:6664`，
-  用 `CORS_ORIGINS` 可以改（逗号分隔）。
+`web/` 是纯静态前端，只认 `/api` 和 `/health`，不知道后端是什么写的。后端只有一套：
+`server-go/`，Go + SQLite。
 
-想把前后端合成同源（比如直接用后端托管 `web/`），把 `web/config.js` 里的
-`window.DARKROOM_API` 改成空串即可，两个后端都会照常提供静态文件。
-
-### 跑 Go 那套
+|  |  |
+| --- | --- |
+| 依赖 | `modernc.org/sqlite`（纯 Go，不需要 CGO 和 gcc）、`golang.org/x/crypto` |
+| 存储 | `data/darkroom.db`（SQLite） |
+| 默认端口 | 6670 |
+| 启动 | `cd server-go && go run .`，或 `go build -o darkroom.exe . && ./darkroom.exe` |
 
 需要 Go 1.26 或更高版本——路由本身 1.22 就够，但 `modernc.org/sqlite` 那一串依赖要求 1.26。
 
-```bash
-cd server-go
-go run .          # 或者 go build -o darkroom.exe . && ./darkroom.exe
-```
+### 前后端分开跑
 
-默认起在 6670，读写 `../data/darkroom.db`，管理端账号密码的默认值和 Node 版一致
-（`admin` / `admin@123`，同样认 `ADMIN_USER` / `ADMIN_PASSWORD`）。
+默认就是这么跑的，属于跨源。所以
 
-Go 版比 Node 版多几个环境变量：
+- `web/config.js` 里把请求指向 `http://<当前主机名>:<后端端口>`；
+- 后端必须回 CORS 头，而且因为登录态是 HttpOnly Cookie，`Access-Control-Allow-Origin`
+  只能回具体来源、不能是 `*`，还要带 `Access-Control-Allow-Credentials`。
+  放行名单默认是 `http://127.0.0.1:6664` 和 `http://localhost:6664`，
+  用 `CORS_ORIGINS` 可以改（逗号分隔）。
+
+想把前后端合成同源（比如直接用后端托管 `web/`），把 `web/config.js` 里的
+`window.DARKROOM_API` 改成空串即可，后端会照常提供静态文件。
+
+### 环境变量
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -108,16 +121,21 @@ Go 版比 Node 版多几个环境变量：
 | `CORS_ORIGINS` | `http://127.0.0.1:6664,http://localhost:6664` | 放行哪些来源跨源访问 |
 | `DATA_FILE` | `../data/darkroom.db` | SQLite 文件路径 |
 | `WEB_DIR` | `../web` | 前端目录 |
+| `ADMIN_USER` | `admin` | 管理端账号 |
+| `ADMIN_PASSWORD` | 无 | 设了之后每次启动都会把管理端对齐到这个值，忘了密码时也能靠它找回 |
 | `RELAY_HOSTS` | uuapi 那四个域名 | 中转域名白名单，逗号分隔。只有自建中转或本地起桩测试才需要改；放开它等于允许把请求发到任意主机 |
 | `RELAY_CA_FILE` | 无 | 额外信任的 CA 证书（PEM），用来接自签证书的中转站 |
 
 ## 上手顺序
 
-1. 打开 http://127.0.0.1:3780/admin ，用 `admin` / `admin@123` 进入管理端。
+1. 打开 http://127.0.0.1:16666/admin ，用 `admin` / `admin@123` 进入管理端。
 2. 在「生图 Key」里加一把 Key：选类型，填中转地址和 API Key。GPT / 香蕉 / 批量填
    `https://uuapi.io/v1`，官方直连填 `https://uuapi.io`。保存后点「刷新余额」，确认能查到余额。
-3. 回到 http://127.0.0.1:3780 ，注册一个账号，点「签到领额度」。
+3. 回到 http://127.0.0.1:16666/login ，注册一个账号，进工作台后点「签到领额度」。
 4. 选调用方式、模型，写好描述，点「生成」。
+
+介绍页的「开始创作」会先问一次 `/api/me`：登录了就进工作台，没登录就进登录页。
+工作台自身也认这一条——没会话时打开 `/studio` 会直接跳回登录页。
 
 ## 批量生图
 
@@ -133,10 +151,13 @@ Go 版比 Node 版多几个环境变量：
 
 ![管理端](docs/admin.png)
 
-- **签到规则**：每天签到领多少额度、每次生图扣多少额度。
-- **生图 Key**：增删改查、启用停用、刷新余额、逐把 Key 配置请求头 `User-Agent`。
+左边一条菜单栏，三块内容分开放在 `#users` / `#keys` / `#checkin` 三个 hash 下，
+刷新和前进后退都能回到原来那一页：
+
+- **用户管理**：改额度、重置密码、停用 / 启用、删除。停用或重置密码会立刻踢掉该用户的所有会话。
+- **API 管理**：Key 的增删改查、启用停用、刷新余额、逐把 Key 配置请求头 `User-Agent`。
   中转地址只接受 `uuapi.io`、`uuapi.net`、`uuapi.shop`、`uuapi.cc` 四个域名下的 https 地址。
-- **用户**：改额度、重置密码、停用 / 启用、删除。停用或重置密码会立刻踢掉该用户的所有会话。
+- **签到**：每天签到领多少额度、每次生图扣多少额度，以及改管理端自己的密码。
 
 ### 余额是怎么查的
 
@@ -156,14 +177,6 @@ Go 版比 Node 版多几个环境变量：
 
 <img src="docs/studio-mobile.png" alt="手机端" width="320" />
 
-## 配置
-
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `PORT` | `3780` | 监听端口 |
-| `ADMIN_USER` | `admin` | 管理端账号 |
-| `ADMIN_PASSWORD` | `admin@123` | 管理端密码；设了之后每次启动都会对齐成这个值 |
-
 ## HTTP 接口
 
 | 方法 | 路径 | 说明 |
@@ -174,7 +187,14 @@ Go 版比 Node 版多几个环境变量：
 | `GET` | `/api/me` | 当前用户、签到额度、每次生图消耗 |
 | `POST` | `/api/checkin` | 签到领额度 |
 | `POST` | `/api/me/password` | 改自己的密码 |
+| `PATCH` | `/api/me` | 改中文名。body `{displayName}`，最多 24 字 |
 | `POST` | `/api/generate` | 生图（先扣额度，失败退回） |
+| `GET` | `/api/generations` | 自己的作品集。`limit`（默认 24，上限 100）、`offset` |
+| `GET` | `/api/generations/{id}` | 作品详情。自己的，或已公开的 |
+| `PATCH` | `/api/generations/{id}` | 公开 / 取消公开。body `{isPublic}` |
+| `DELETE` | `/api/generations/{id}` | 删除自己的作品 |
+| `GET` | `/api/generations/{id}/images/{position}` | 作品图片（原始字节） |
+| `GET` | `/api/works` | 公开作品。不登录也能看 |
 | `POST` | `/api/batches` | 提交批量任务（按条目扣额度，提交失败退回） |
 | `GET` | `/api/batches` | 批量任务列表 |
 | `GET` | `/api/batches/models` | 批量可用的模型 |
@@ -196,6 +216,38 @@ Go 版比 Node 版多几个环境变量：
 | `POST` | `/api/admin/users/{id}/password` | 重置某个用户的密码 |
 | `DELETE` | `/api/admin/users/{id}` | 删除用户 |
 | `GET` | `/health` | 健康检查 |
+
+`POST /api/auth/register` 的正文：
+
+```json
+{
+  "username": "wuyi2026",
+  "displayName": "吴一",
+  "password": "abcd1234",
+  "phone": "13800138000",
+  "email": "wuyi@example.com"
+}
+```
+
+| 字段 | 规则 |
+| --- | --- |
+| `username` | 必填。2–20 位，**只能用英文字母和数字**，不区分大小写地唯一 |
+| `displayName` | 可选。中文名，最多 24 个字 |
+| `password` | 必填。**至少 8 位**，最多 72 位 |
+| `phone` | 必填。11 位大陆手机号（1 开头、第二位 3–9），不查重 |
+| `email` | 必填。格式校验，不区分大小写地唯一，**可以当登录名用** |
+
+`POST /api/auth/login` 的正文：
+
+```json
+{ "account": "wuyi2026", "password": "abcd1234" }
+```
+
+`account` 既收名称也收邮箱，两者都不区分大小写。
+
+**管理端的账号密码也能登用户端。** 用户表里查不到（或密码对不上）时，会再拿 `admin` 表比一次；
+对上了就给它补一条用户记录，之后走普通用户那一套——额度、签到、生图都正常。
+补出来的记录邮箱手机号留空，所以走不了邮箱登录，也不占用唯一邮箱。
 
 `POST /api/generate` 的正文（GPT 生图）：
 
@@ -249,15 +301,26 @@ Go 版比 Node 版多几个环境变量：
 ```
 web-server.js       前端静态服务（只发 web/，不碰数据）
 web/                前端（纯静态，没有构建步骤）
-  index.html          用户端
+  index.html          介绍页（首页，飞天 hero）
+  login.html          登录 / 注册
+  studio.html         工作台首页（额度、签到）
+  create.html         创作（生图表单、批量）
+  gallery.html        作品集（自己的）
+  works.html          公开作品
+  settings.html       系统设置
   admin.html          管理端
   styles.css          设计体系
-  app.js / admin.js   页面逻辑
+  landing.js          介绍页的登录态分流
+  login.js            登录 / 注册逻辑
+  shell.js            工作台外壳：左菜单栏、顶栏用户菜单、登录态
+  home.js             首页
+  create.js           创作
+  gallery.js          作品集 / 公开作品（两页共用）
+  settings.js         系统设置
+  admin.js            管理端
   config.js           后端地址
-server/             后端（Node，只用内置模块）
-  server.js           HTTP 服务、路由、上游调用与降级
-  store.js            用户、会话、Key、额度的读写
-server-go/          后端（Go + SQLite，另一套实现）
+  art/                敦煌图（介绍页 hero、登录页壁画）
+server-go/          后端（Go + SQLite）
   main.go             HTTP 服务、路由、参数校验
   store.go            建表与用户、会话、Key、额度的读写
   relay.go            上游调用与降级
@@ -267,13 +330,13 @@ docs/
 data/               运行时数据（已 gitignore）
 ```
 
-前端只依赖 `/api` 和 `/health`，不知道后端是什么写的。再写第三套后端也行：照着 `docs/API.md`
+前端只依赖 `/api` 和 `/health`，不知道后端是什么写的。想换一套后端也行：照着 `docs/API.md`
 实现接口即可，`web/` 一个字节都不用动；也可以把 `web/` 丢给任何静态服务器，
 再用 `web/config.js` 把请求指到别的地址。
 
 ## 说明
 
-- 数据都写在 `data/store.json` 里，API Key 是明文存的。别把这个目录提交上去，也别把服务开到公网。
+- 数据都写在 `data/darkroom.db` 里，API Key 是明文存的。别把这个目录提交上去，也别把服务开到公网。
 - 会话用 HttpOnly Cookie，有效期 14 天。管理端和用户端的会话是分开的。
 - 请求上游超时 120 秒，异步任务最多轮询 180 秒；请求体上限 32MB，参考图和蒙版上限 20MB。
 - 中转地址和参考图地址都只收 https，参考图地址还会挡掉本机、内网和 `.local` / `.internal`，

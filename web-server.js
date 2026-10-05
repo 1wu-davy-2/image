@@ -28,10 +28,21 @@ const MIME = {
   ".woff2": "font/woff2",
 };
 
+// 无扩展名的路径映射到具体页面，省得每个页面加一条判断。
+const PAGES = {
+  admin: "admin.html",
+  studio: "studio.html",
+  login: "login.html",
+  create: "create.html",
+  gallery: "gallery.html",
+  works: "works.html",
+  settings: "settings.html",
+};
+
 function resolveFile(urlPath) {
   const pathname = decodeURIComponent(urlPath.split("?")[0]);
-  let relative = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
-  if (relative === "admin" || relative === "admin/") relative = "admin.html";
+  let relative = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "").replace(/\/$/, "");
+  if (PAGES[relative]) relative = PAGES[relative];
   // path.resolve 会吃掉 ..，再确认结果仍在 web/ 里。
   const file = path.resolve(ROOT, relative);
   if (file !== ROOT && !file.startsWith(ROOT + path.sep)) return null;

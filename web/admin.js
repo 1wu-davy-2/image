@@ -19,6 +19,26 @@ const userRows = document.querySelector("#userRows");
 
 let state = { keys: [], users: [], settings: { checkinQuota: 5, generateCost: 1 } };
 
+// 三块内容装在一个页面里，靠 hash 切。这样刷新和前进后退都能回到原来那一页，
+// 也不用为了三个菜单项多开三个 HTML。
+const PANELS = ["users", "keys", "checkin"];
+
+function currentPanel() {
+  const name = window.location.hash.replace(/^#/, "");
+  return PANELS.includes(name) ? name : PANELS[0];
+}
+
+function showPanel() {
+  const name = currentPanel();
+  document.querySelectorAll("section[data-panel]").forEach((section) => {
+    section.classList.toggle("hidden", section.dataset.panel !== name);
+  });
+  document.querySelectorAll("#adminNav .sidebar-link").forEach((link) => {
+    if (link.dataset.panel === name) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  });
+}
+
 function setStatus(el, message, isError) {
   el.textContent = message || "";
   el.classList.toggle("error", Boolean(isError));
@@ -60,9 +80,17 @@ function fillForm(key) {
   document.querySelector("#saveKey").textContent = key ? "保存修改" : "保存 Key";
 }
 
+function renderStats() {
+  // 「可用」的算法和挑 Key 时一致：启用的、且中转站没说过失效的。
+  const usable = state.keys.filter((key) => key.enabled && key.balanceValid !== false).length;
+  document.querySelector("#statUsers").textContent = String(state.users.length);
+  document.querySelector("#statKeys").textContent = `生图 Key ${state.keys.length} 把 · ${usable} 把可用`;
+}
+
 function render() {
   document.querySelector("#checkinQuota").value = state.settings.checkinQuota;
   document.querySelector("#generateCost").value = state.generateCost ?? state.settings.generateCost;
+  renderStats();
   keyRows.replaceChildren();
   if (!state.keys.length) {
     const row = document.createElement("tr");
@@ -368,6 +396,10 @@ document.querySelector("#keyForm").addEventListener("submit", async (event) => {
     setStatus(keyStatus, error.message, true);
   }
 });
+
+// 先切一次面板再登录：登录成功后 #appView 才显示出来，省得先闪一下「用户管理」。
+showPanel();
+window.addEventListener("hashchange", showPanel);
 
 loadState().catch(() => {
   appView.classList.add("hidden");

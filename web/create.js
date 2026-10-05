@@ -1,5 +1,11 @@
-const PREFS_KEY = "darkroom.prefs";
-const HISTORY_KEY = "darkroom.history";
+// 创作页：生图表单 + 批量生图。
+// 外壳（左侧菜单栏、顶栏用户菜单、登录态）在 shell.js 里，这里只管 main 里的东西。
+// 生成的图由服务端存进作品集，这里不再往 localStorage 塞历史。
+
+(() => {
+
+const api = window.Darkroom.api;
+const prefsKey = "darkroom.prefs";
 
 const MODELS = {
   gpt: [
@@ -26,21 +32,7 @@ const HINTS = {
 
 const CHANNEL_LABEL = { async: "异步", sync: "同步", chat: "对话生图", gemini: "官方格式" };
 
-// 所有请求都从这里过，方便整体指向另一个后端。见 config.js。
-const API_BASE = String(window.DARKROOM_API || "").replace(/\/+$/, "");
-function api(path) {
-  return `${API_BASE}${path}`;
-}
-
 const form = document.querySelector("#form");
-const guestAuth = document.querySelector("#guestAuth");
-const userAuth = document.querySelector("#userAuth");
-const username = document.querySelector("#username");
-const password = document.querySelector("#password");
-const hello = document.querySelector("#hello");
-const quota = document.querySelector("#quota");
-const checkinBtn = document.querySelector("#checkinBtn");
-const checkinHint = document.querySelector("#checkinHint");
 const protocol = document.querySelector("#protocol");
 const protocolHint = document.querySelector("#protocolHint");
 const model = document.querySelector("#model");
@@ -60,7 +52,6 @@ const imageFile = document.querySelector("#imageFile");
 const imageUrl = document.querySelector("#imageUrl");
 const maskFile = document.querySelector("#maskFile");
 const maskUrl = document.querySelector("#maskUrl");
-const passwordBox = document.querySelector("#passwordBox");
 const batchModel = document.querySelector("#batchModel");
 const batchPrompts = document.querySelector("#batchPrompts");
 const batchSize = document.querySelector("#batchSize");
@@ -74,20 +65,13 @@ const status = document.querySelector("#status");
 const canvas = document.querySelector("#canvas");
 const meta = document.querySelector("#meta");
 const actions = document.querySelector("#actions");
-const historyEl = document.querySelector("#history");
 
-const sessionImages = new Map();
-let history = [];
-let currentId = "";
 let tick = 0;
-let me = null;
-let checkinQuota = 5;
-let generateCost = 1;
 let batchBusy = false;
 
 function loadPrefs() {
   try {
-    const saved = JSON.parse(localStorage.getItem(PREFS_KEY) || "{}");
+    const saved = JSON.parse(localStorage.getItem(prefsKey) || "{}");
     if (saved.protocol) protocol.value = saved.protocol;
     if (saved.model) model.dataset.prefer = saved.model;
     if (saved.customModel) customModel.value = saved.customModel;
@@ -102,18 +86,12 @@ function loadPrefs() {
       if (radio) radio.checked = true;
     }
   } catch {
-    localStorage.removeItem(PREFS_KEY);
-  }
-  try {
-    history = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
-    if (!Array.isArray(history)) history = [];
-  } catch {
-    history = [];
+    localStorage.removeItem(prefsKey);
   }
 }
 
 function savePrefs() {
-  localStorage.setItem(PREFS_KEY, JSON.stringify({
+  localStorage.setItem(prefsKey, JSON.stringify({
     protocol: protocol.value,
     model: model.value,
     customModel: customModel.value.trim(),
@@ -170,44 +148,6 @@ function setStatus(message, isError) {
   status.classList.toggle("error", Boolean(isError));
 }
 
-function renderAuth() {
-  const loggedIn = Boolean(me && me.user);
-  guestAuth.classList.toggle("hidden", loggedIn);
-  userAuth.classList.toggle("hidden", !loggedIn);
-  if (!loggedIn) return;
-  hello.textContent = me.user.username;
-  quota.textContent = String(me.user.quota);
-  checkinBtn.disabled = me.user.checkedInToday;
-  checkinBtn.textContent = me.user.checkedInToday ? "今日已签到" : "签到领额度";
-  checkinHint.textContent = me.user.checkedInToday
-    ? `今天已经领过。每次生图消耗 ${generateCost} 额度。`
-    : `每天可领 ${checkinQuota} 额度，北京时间 0 点刷新。每次生图消耗 ${generateCost}。`;
-}
-
-async function refreshMe() {
-  const response = await fetch(api("/api/me"), { credentials: "include" });
-  const data = await response.json();
-  me = data;
-  checkinQuota = data.checkinQuota;
-  generateCost = data.generateCost;
-  renderAuth();
-  loadBatches({ quiet: true });
-}
-
-async function auth(path) {
-  const response = await fetch(api(path), {
-    credentials: "include",
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: username.value.trim(), password: password.value }),
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data.ok) throw new Error(data.error || "登录失败");
-  password.value = "";
-  await refreshMe();
-  setStatus(path.endsWith("register") ? "注册成功。" : "已登录。");
-}
-
 function imageSrc(image) {
   if (!image) return "";
   if (image.url) return image.url;
@@ -216,7 +156,6 @@ function imageSrc(image) {
 }
 
 function showResult(entry) {
-  currentId = entry.id;
   const images = entry.images || [];
   canvas.replaceChildren();
   if (!images.length) {
@@ -225,15 +164,15 @@ function showResult(entry) {
     empty.textContent = "这次没有拿到图片。";
     canvas.append(empty);
   } else {
-    images.forEach((image, index) => {
+    for (const image of images) {
       const img = document.createElement("img");
       img.alt = entry.prompt;
       img.src = imageSrc(image);
       canvas.append(img);
-      if (index === 0 && images.length === 1) img.alt = entry.prompt;
-    });
+    }
   }
-  meta.textContent = [entry.model, entry.sizeLabel, CHANNEL_LABEL[entry.channel] || entry.channel, entry.taskId].filter(Boolean).join(" · ");
+  meta.textContent = [entry.model, entry.sizeLabel, CHANNEL_LABEL[entry.channel] || entry.channel, entry.taskId]
+    .filter(Boolean).join(" · ");
   actions.classList.remove("hidden");
   actions.replaceChildren();
   images.forEach((image, index) => {
@@ -245,44 +184,10 @@ function showResult(entry) {
     open.textContent = images.length > 1 ? `打开 ${index + 1}` : "打开原图";
     const download = document.createElement("a");
     download.href = src;
-    download.download = `darkroom-${entry.id}${images.length > 1 ? `-${index + 1}` : ""}.png`;
+    download.download = `darkroom-${Date.now()}${images.length > 1 ? `-${index + 1}` : ""}.png`;
     download.textContent = "下载";
     actions.append(open, download);
   });
-  renderHistory();
-}
-
-function renderHistory() {
-  historyEl.replaceChildren();
-  if (!history.length) {
-    const empty = document.createElement("p");
-    empty.textContent = "还没有记录。";
-    historyEl.append(empty);
-    return;
-  }
-  history.forEach((entry) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.title = entry.prompt;
-    button.setAttribute("aria-label", entry.prompt);
-    if (entry.id === currentId) button.setAttribute("aria-current", "true");
-    const src = imageSrc(entry.images[0]);
-    if (src && (src.startsWith("https://") || src.startsWith("http://") || src.startsWith("data:image/"))) {
-      button.style.backgroundImage = `url("${src.replace(/["\\\n\r]/g, "")}")`;
-    }
-    button.addEventListener("click", () => {
-      prompt.value = entry.prompt;
-      showResult(sessionImages.get(entry.id) || entry);
-    });
-    historyEl.append(button);
-  });
-}
-
-function remember(entry) {
-  const stored = { ...entry, images: entry.images.filter((image) => image.url).map((image) => ({ url: image.url })) };
-  if (entry.images.some((image) => image.b64)) sessionImages.set(entry.id, entry);
-  history = [stored, ...history.filter((item) => item.id !== entry.id)].slice(0, 16);
-  localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
 }
 
 function readFile(file) {
@@ -305,10 +210,7 @@ async function onSubmit(event) {
   event.preventDefault();
   if (submit.disabled) return;
   savePrefs();
-  if (!me || !me.user) {
-    setStatus("请先登录。注册后可以签到领取额度。", true);
-    return;
-  }
+
   const chosenModel = selectedModel();
   if (!chosenModel) {
     setStatus("请填写模型名。", true);
@@ -347,34 +249,26 @@ async function onSubmit(event) {
       else if (maskUrl.value.trim()) payload.maskUrl = maskUrl.value.trim();
     }
     const response = await fetch(api("/api/generate"), {
-    credentials: "include",
+      credentials: "include",
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     const data = await response.json().catch(() => ({}));
-    if (typeof data.quota === "number" && me.user) {
-      me.user.quota = data.quota;
-      renderAuth();
-    }
+    if (typeof data.quota === "number") window.Darkroom.setQuota(data.quota);
     if (!response.ok || !data.ok) throw new Error(data.error || `请求失败（${response.status}）`);
-    const entry = {
-      id: String(Date.now()),
+    showResult({
       prompt: text,
       model: chosenModel,
       sizeLabel,
       channel: data.channel,
       taskId: data.taskId || "",
       images: data.images || [],
-    };
-    remember(entry);
-    showResult(sessionImages.get(entry.id) || entry);
-    const onlyInline = entry.images.length > 0 && entry.images.every((image) => image.b64 && !image.url);
-    if (onlyInline) setStatus("完成。结果是内联图片，刷新页面后不会留在历史里。");
-    else if (data.channel === "chat") setStatus("完成。这次走的是对话生图。");
-    else if (data.channel === "gemini") setStatus("完成。这次走的是 Gemini 官方格式。");
-    else if (data.channel === "sync") setStatus("完成。这次走的是同步接口。");
-    else setStatus("完成。");
+    });
+    if (data.channel === "chat") setStatus("完成。这次走的是对话生图，已收进作品集。");
+    else if (data.channel === "gemini") setStatus("完成。这次走的是 Gemini 官方格式，已收进作品集。");
+    else if (data.channel === "sync") setStatus("完成。这次走的是同步接口，已收进作品集。");
+    else setStatus("完成。已收进作品集。");
   } catch (error) {
     setStatus(error.message || "生成失败", true);
   } finally {
@@ -382,60 +276,6 @@ async function onSubmit(event) {
     submit.disabled = false;
   }
 }
-
-document.querySelector("#loginBtn").addEventListener("click", () => auth("/api/auth/login").catch((error) => setStatus(error.message, true)));
-document.querySelector("#registerBtn").addEventListener("click", () => auth("/api/auth/register").catch((error) => setStatus(error.message, true)));
-password.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
-    event.preventDefault();
-    document.querySelector("#loginBtn").click();
-  }
-});
-document.querySelector("#logoutBtn").addEventListener("click", async () => {
-  await fetch(api("/api/auth/logout"), { method: "POST", credentials: "include" });
-  me = { user: null, checkinQuota, generateCost };
-  renderAuth();
-  loadBatches({ quiet: true });
-  setStatus("已退出。");
-});
-document.querySelector("#passwordToggle").addEventListener("click", () => {
-  passwordBox.classList.toggle("hidden");
-});
-document.querySelector("#changePasswordBtn").addEventListener("click", async () => {
-  try {
-    const response = await fetch(api("/api/me/password"), {
-    credentials: "include",
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        oldPassword: document.querySelector("#oldPassword").value,
-        newPassword: document.querySelector("#newPassword").value,
-      }),
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || !data.ok) throw new Error(data.error || "改密码失败");
-    document.querySelector("#oldPassword").value = "";
-    document.querySelector("#newPassword").value = "";
-    passwordBox.classList.add("hidden");
-    setStatus("密码已修改。");
-  } catch (error) {
-    setStatus(error.message, true);
-  }
-});
-checkinBtn.addEventListener("click", async () => {
-  checkinBtn.disabled = true;
-  try {
-    const response = await fetch(api("/api/checkin"), { method: "POST", credentials: "include" });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || !data.ok) throw new Error(data.error || "签到失败");
-    me.user = data.user;
-    renderAuth();
-    setStatus(`签到成功，领取 ${data.amount} 额度。`);
-  } catch (error) {
-    checkinBtn.disabled = false;
-    setStatus(error.message, true);
-  }
-});
 
 form.addEventListener("change", () => {
   syncFields();
@@ -445,6 +285,8 @@ form.addEventListener("submit", onSubmit);
 prompt.addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") form.requestSubmit();
 });
+
+/* ---------- 批量生图 ---------- */
 
 function setBatchStatus(message, isError) {
   batchStatus.textContent = message || "";
@@ -459,7 +301,7 @@ function batchButton(label, handler) {
   return button;
 }
 
-// The relay's list shape is not fixed, so accept the wrappers it is likely to use.
+// 上游的列表形状不固定，把可能的外壳都认一遍。
 function batchEntries(result) {
   if (Array.isArray(result)) return result;
   for (const key of ["data", "batches", "items"]) {
@@ -469,9 +311,9 @@ function batchEntries(result) {
 }
 
 function batchSummary(batch) {
-  const status = String(batch?.status || "");
+  const state = String(batch?.status || "");
   const counts = batch?.item_count ?? batch?.request_counts?.total ?? batch?.outputs;
-  return [status, counts === undefined ? "" : `${counts} 条`].filter(Boolean).join(" · ") || "未知状态";
+  return [state, counts === undefined ? "" : `${counts} 条`].filter(Boolean).join(" · ") || "未知状态";
 }
 
 function renderBatches(result) {
@@ -491,13 +333,13 @@ function renderBatches(result) {
     const label = document.createElement("div");
     const title = document.createElement("strong");
     title.textContent = id || "（上游没给编号）";
-    const meta = document.createElement("small");
-    meta.textContent = batchSummary(batch);
-    label.append(title, meta);
-    const actions = document.createElement("div");
-    actions.className = "row-actions";
+    const info = document.createElement("small");
+    info.textContent = batchSummary(batch);
+    label.append(title, info);
+    const rowActions = document.createElement("div");
+    rowActions.className = "row-actions";
     if (id) {
-      actions.append(
+      rowActions.append(
         batchButton("刷新", () => refreshBatch(id)),
         batchButton("下载", () => {
           window.location.href = api(`/api/batches/${encodeURIComponent(id)}/download`);
@@ -506,17 +348,12 @@ function renderBatches(result) {
         batchButton("删除", () => deleteBatch(id)),
       );
     }
-    row.append(label, actions);
+    row.append(label, rowActions);
     batchList.append(row);
   });
 }
 
 async function loadBatches({ quiet = false } = {}) {
-  if (!me || !me.user) {
-    renderBatches([]);
-    if (!quiet) setBatchStatus("请先登录。", true);
-    return;
-  }
   try {
     const response = await fetch(api("/api/batches"), { credentials: "include" });
     const data = await response.json().catch(() => ({}));
@@ -556,17 +393,13 @@ function deleteBatch(id) {
 
 async function submitBatch() {
   if (batchBusy) return;
-  if (!me || !me.user) {
-    setBatchStatus("请先登录。", true);
-    return;
-  }
   const prompts = batchPrompts.value.split("\n").map((line) => line.trim()).filter(Boolean);
   if (!prompts.length) {
     setBatchStatus("至少写一条提示词。", true);
     return;
   }
-  const model = batchModel.value.trim();
-  if (!model) {
+  const chosen = batchModel.value.trim();
+  if (!chosen) {
     setBatchStatus("请填写模型名。", true);
     return;
   }
@@ -575,22 +408,19 @@ async function submitBatch() {
   setBatchStatus(`正在提交 ${prompts.length} 条…`);
   try {
     const response = await fetch(api("/api/batches"), {
-    credentials: "include",
+      credentials: "include",
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model,
+        model: chosen,
         provider: batchProvider.value,
         image_size: batchSize.value,
         response_mime_type: "image/png",
-        items: prompts.map((prompt, index) => ({ custom_id: `item_${index + 1}`, prompt, output_count: 1 })),
+        items: prompts.map((text, index) => ({ custom_id: `item_${index + 1}`, prompt: text, output_count: 1 })),
       }),
     });
     const data = await response.json().catch(() => ({}));
-    if (typeof data.quota === "number" && me.user) {
-      me.user.quota = data.quota;
-      renderAuth();
-    }
+    if (typeof data.quota === "number") window.Darkroom.setQuota(data.quota);
     if (!response.ok || !data.ok) throw new Error(data.error || `提交失败（${response.status}）`);
     batchPrompts.value = "";
     setBatchStatus(`已提交 ${data.outputs} 条，扣了 ${data.cost} 额度。`);
@@ -609,5 +439,6 @@ batchRefresh.addEventListener("click", () => loadBatches());
 loadPrefs();
 fillModels();
 syncFields();
-renderHistory();
-refreshMe().catch(() => setStatus("暂时连不上本机服务。", true));
+window.Darkroom.ready.then(() => loadBatches({ quiet: true }));
+
+})();

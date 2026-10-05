@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>暗房 · 登录</title>
+    <meta name="theme-color" content="#f6f1e6" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%23f6f1e6'/%3E%3Cpath d='M3 11c3-4 7-4 10 0' stroke='%234f6f72' stroke-width='1.4' fill='none'/%3E%3Ccircle cx='8' cy='5.5' r='2' fill='%23c9b07a'/%3E%3C/svg%3E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="login-page">
+    <header class="top">
+      <div class="top-inner">
+        <div class="brand">
+          <p class="eyebrow">UU API · Image</p>
+          <h1>暗房</h1>
+        </div>
+        <nav class="nav">
+          <a href="./"><span>介绍</span></a>
+          <a href="./studio"><span>创作</span></a>
+          <a href="./admin"><span>管理</span></a>
+        </nav>
+      </div>
+      <div class="motif" aria-hidden="true">
+        <svg viewBox="0 0 1200 36" fill="none">
+          <path d="M20 22c18-14 36-14 54 0s36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0" stroke="currentColor" stroke-opacity="0.45" stroke-width="1" />
+          <path d="M0 12 C80 4, 140 20, 220 10 S360 4, 440 14 600 6, 700 16 860 4, 960 12 1100 6, 1200 14" stroke="var(--gold)" stroke-opacity="0.55" stroke-width="1" />
+          <path d="M90 28c12-10 28-10 40 0M250 28c12-10 28-10 40 0M430 28c12-10 28-10 40 0M610 28c12-10 28-10 40 0M790 28c12-10 28-10 40 0M970 28c12-10 28-10 40 0" stroke="var(--green)" stroke-opacity="0.5" stroke-width="1" />
+          <circle cx="180" cy="10" r="1.6" fill="var(--cinnabar)" opacity="0.55" />
+          <circle cx="520" cy="8" r="1.4" fill="var(--gold)" opacity="0.7" />
+          <circle cx="860" cy="11" r="1.6" fill="var(--cinnabar)" opacity="0.5" />
+        </svg>
+      </div>
+    </header>
+
+    <main class="login-split">
+      <div class="login-art">
+        <img src="./art/login-mural.jpg" alt="敦煌莫高窟壁画" />
+        <div class="login-art-veil" aria-hidden="true"></div>
+        <div class="login-art-caption">
+          <p class="eyebrow">敦煌 · 莫高窟</p>
+          <p class="login-art-title">飞天</p>
+        </div>
+      </div>
+
+      <section class="login-panel">
+        <div class="login-box">
+          <p class="eyebrow">画坊</p>
+          <h1 class="login-title">进门</h1>
+          <p class="login-lede">登录后可以签到领额度、生图。没有账号就点注册，注册完直接进来。</p>
+
+          <div class="seg" role="radiogroup" aria-label="登录或注册">
+            <label><input type="radio" name="authMode" value="login" checked /> 登录</label>
+            <label><input type="radio" name="authMode" value="register" /> 注册</label>
+          </div>
+
+          <form id="loginForm" class="card">
+            <div class="card-head">
+              <h3>账号</h3>
+            </div>
+            <label for="loginAccount">名称或邮箱</label>
+            <input id="loginAccount" name="account" autocomplete="username" spellcheck="false" />
+            <label for="loginPassword">密码</label>
+            <input id="loginPassword" name="password" type="password" autocomplete="current-password" />
+            <div class="spaced-lg">
+              <button type="submit" class="primary wide">登录</button>
+            </div>
+          </form>
+
+          <form id="registerForm" class="card hidden">
+            <div class="card-head">
+              <h3>新账号</h3>
+            </div>
+
+            <label for="regUsername">名称</label>
+            <input id="regUsername" name="username" autocomplete="username" spellcheck="false" maxlength="20" />
+            <p class="hint">2 到 20 位，只能用英文字母和数字。</p>
+
+            <label for="regDisplayName">中文名（可选）</label>
+            <input id="regDisplayName" name="displayName" autocomplete="nickname" maxlength="24" />
+
+            <label for="regPassword">密码</label>
+            <input id="regPassword" name="password" type="password" autocomplete="new-password" />
+            <p class="hint">至少 8 位。</p>
+
+            <label for="regPhone">手机号</label>
+            <input id="regPhone" name="phone" type="tel" inputmode="numeric" autocomplete="tel" maxlength="11" />
+            <p class="hint">11 位大陆手机号。</p>
+
+            <label for="regEmail">邮箱</label>
+            <input id="regEmail" name="email" type="email" autocomplete="email" spellcheck="false" />
+            <p class="hint">邮箱也能用来登录，一个邮箱只能注册一个账号。</p>
+
+            <div class="spaced-lg">
+              <button type="submit" class="primary wide">注册</button>
+            </div>
+          </form>
+
+          <p id="status" class="status" role="status" aria-live="polite"></p>
+        </div>
+      </section>
+    </main>
+
+    <script src="./config.js"></script>
+    <script src="./login.js"></script>
+  </body>
+</html>

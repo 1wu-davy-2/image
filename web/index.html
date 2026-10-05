@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>暗房 · 生图</title>
+    <title>暗房 · 把愿望画成图</title>
     <meta name="theme-color" content="#f6f1e6" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%23f6f1e6'/%3E%3Cpath d='M3 11c3-4 7-4 10 0' stroke='%234f6f72' stroke-width='1.4' fill='none'/%3E%3Ccircle cx='8' cy='5.5' r='2' fill='%23c9b07a'/%3E%3C/svg%3E" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -11,271 +11,48 @@
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@500;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
-  <body>
-    <header class="top">
-      <div class="top-inner">
-        <div class="brand">
-          <p class="eyebrow">UU API · Image</p>
-          <h1>暗房</h1>
-        </div>
-        <nav class="nav">
-          <a href="./" aria-current="page"><span>创作</span></a>
-          <a href="./admin"><span>管理</span></a>
-        </nav>
-      </div>
-      <div class="motif" aria-hidden="true">
-        <svg viewBox="0 0 1200 36" fill="none">
-          <path d="M20 22c18-14 36-14 54 0s36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0 36 14 54 0 36-14 54 0" stroke="currentColor" stroke-opacity="0.45" stroke-width="1" />
-          <path d="M0 12 C80 4, 140 20, 220 10 S360 4, 440 14 600 6, 700 16 860 4, 960 12 1100 6, 1200 14" stroke="var(--gold)" stroke-opacity="0.55" stroke-width="1" />
-          <path d="M90 28c12-10 28-10 40 0M250 28c12-10 28-10 40 0M430 28c12-10 28-10 40 0M610 28c12-10 28-10 40 0M790 28c12-10 28-10 40 0M970 28c12-10 28-10 40 0" stroke="var(--green)" stroke-opacity="0.5" stroke-width="1" />
-          <circle cx="180" cy="10" r="1.6" fill="var(--cinnabar)" opacity="0.55" />
-          <circle cx="520" cy="8" r="1.4" fill="var(--gold)" opacity="0.7" />
-          <circle cx="860" cy="11" r="1.6" fill="var(--cinnabar)" opacity="0.5" />
-        </svg>
-      </div>
-    </header>
+  <body class="landing">
+    <main class="hero">
+      <picture>
+        <source media="(max-width: 640px)" srcset="./art/hero-tall.jpg" />
+        <img class="hero-photo" src="./art/hero-wide.jpg" alt="敦煌飞天：飘带、祥云与月" />
+      </picture>
+      <div class="hero-veil" aria-hidden="true"></div>
+      <div class="paper-grain" aria-hidden="true"></div>
 
-    <main class="wrap">
-      <div class="page-head">
-        <p class="eyebrow">画坊</p>
-        <h2>把愿望画成图</h2>
-        <p>每天签到领额度，选一种调用方式，写下画面。</p>
-      </div>
+      <div class="hero-inner">
+        <p class="eyebrow hero-eyebrow">敦煌</p>
+        <h1 class="hero-title">暗房</h1>
+        <p class="hero-lede">把愿望画成图。</p>
 
-      <div class="layout">
-        <div class="stack">
-          <section class="card" aria-label="账号">
-            <div class="card-head">
-              <h3>账号</h3>
-            </div>
-
-            <div id="guestAuth">
-              <div class="split">
-                <div>
-                  <label for="username">用户名</label>
-                  <input id="username" name="username" autocomplete="username" maxlength="20" />
-                </div>
-                <div>
-                  <label for="password">密码</label>
-                  <input id="password" name="password" type="password" autocomplete="current-password" />
-                </div>
-              </div>
-              <div class="row-actions spaced">
-                <button type="button" id="loginBtn" class="primary">登录</button>
-                <button type="button" id="registerBtn">注册</button>
-              </div>
-            </div>
-
-            <div id="userAuth" class="hidden">
-              <div class="card-head">
-                <div>
-                  <span id="hello" class="eyebrow"></span>
-                  <div><strong id="quota" class="quota-number">0</strong> <span class="hint-inline">额度</span></div>
-                </div>
-                <div class="row-actions">
-                  <button type="button" id="checkinBtn" class="small">签到领额度</button>
-                  <button type="button" id="passwordToggle" class="ghost">改密码</button>
-                  <button type="button" id="logoutBtn" class="ghost">退出</button>
-                </div>
-              </div>
-              <p id="checkinHint" class="hint"></p>
-              <div id="passwordBox" class="hidden">
-                <div class="hairline"></div>
-                <div class="split">
-                  <div>
-                    <label for="oldPassword">原密码</label>
-                    <input id="oldPassword" type="password" autocomplete="current-password" />
-                  </div>
-                  <div>
-                    <label for="newPassword">新密码</label>
-                    <input id="newPassword" type="password" autocomplete="new-password" />
-                  </div>
-                </div>
-                <div class="row-actions spaced">
-                  <button type="button" id="changePasswordBtn" class="primary small">保存新密码</button>
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <form id="form" class="card">
-            <div class="card-head">
-              <h3>画面</h3>
-            </div>
-
-            <div class="seg" role="radiogroup" aria-label="生成方式">
-              <label><input type="radio" name="mode" value="generate" checked /> 文生图</label>
-              <label><input type="radio" name="mode" value="edit" /> 图生图</label>
-            </div>
-
-            <label for="protocol">调用方式</label>
-            <select id="protocol" name="protocol">
-              <option value="gpt">GPT 生图</option>
-              <option value="nano">Nano Banana 香蕉生图</option>
-              <option value="gemini-official">GEMINI官方直连-带生图</option>
-            </select>
-            <p id="protocolHint" class="hint"></p>
-
-            <label for="model">模型</label>
-            <select id="model" name="model"></select>
-            <input id="customModel" name="customModel" class="hidden" placeholder="填写模型名" spellcheck="false" />
-
-            <label for="prompt">描述</label>
-            <textarea id="prompt" name="prompt" rows="6" required placeholder="冬夜里的灯塔，海面翻着白浪，胶片颗粒，窗口是暖色的。"></textarea>
-
-            <div id="editFields" class="hidden">
-              <div class="hairline"></div>
-              <label for="imageFile">参考图</label>
-              <input id="imageFile" name="imageFile" type="file" accept="image/png,image/jpeg,image/webp" />
-              <label for="imageUrl">或图片 URL</label>
-              <input id="imageUrl" name="imageUrl" type="url" placeholder="https://example.com/reference.png" />
-              <label for="maskFile">蒙版（可选，透明的地方会被重绘）</label>
-              <input id="maskFile" name="maskFile" type="file" accept="image/png,image/jpeg,image/webp" />
-              <label for="maskUrl">或蒙版 URL</label>
-              <input id="maskUrl" name="maskUrl" type="url" placeholder="https://example.com/mask.png" />
-              <p class="hint">蒙版只对 GPT 和香蕉生图有效，Gemini 官方直连不支持。</p>
-            </div>
-
-            <div id="pixelSize" class="split">
-              <div>
-                <label for="size">尺寸</label>
-                <select id="size" name="size">
-                  <option value="1024x1024">1:1 · 1024×1024</option>
-                  <option value="1024x1536">2:3 · 1024×1536</option>
-                  <option value="1536x1024">3:2 · 1536×1024</option>
-                  <option value="1024x1792">9:16 · 1024×1792</option>
-                  <option value="1792x1024">16:9 · 1792×1024</option>
-                  <option value="2048x2048">1:1 · 2048×2048</option>
-                  <option value="custom">自定义</option>
-                </select>
-              </div>
-              <div>
-                <label for="quality">质量</label>
-                <select id="quality" name="quality">
-                  <option value="medium" selected>medium</option>
-                  <option value="high">high</option>
-                  <option value="auto">auto</option>
-                </select>
-              </div>
-            </div>
-
-            <div id="geminiSize" class="split hidden">
-              <div>
-                <label for="aspectRatio">画幅</label>
-                <select id="aspectRatio" name="aspectRatio">
-                  <option value="1:1">1:1</option>
-                  <option value="3:2">3:2</option>
-                  <option value="2:3">2:3</option>
-                  <option value="4:3">4:3</option>
-                  <option value="3:4">3:4</option>
-                  <option value="16:9">16:9</option>
-                  <option value="9:16">9:16</option>
-                </select>
-              </div>
-              <div>
-                <label for="imageSize">分辨率</label>
-                <select id="imageSize" name="imageSize">
-                  <option value="1K">1K</option>
-                  <option value="2K">2K</option>
-                  <option value="4K">4K</option>
-                </select>
-              </div>
-            </div>
-
-            <div id="customSize" class="split hidden">
-              <div>
-                <label for="width">宽</label>
-                <input id="width" name="width" type="number" min="256" max="8192" step="1" value="1024" />
-              </div>
-              <div>
-                <label for="height">高</label>
-                <input id="height" name="height" type="number" min="256" max="8192" step="1" value="1024" />
-              </div>
-            </div>
-
-            <div class="spaced-lg">
-              <button id="submit" type="submit" class="primary wide">生成</button>
-            </div>
-            <p id="status" class="status" role="status" aria-live="polite"></p>
-
-            <details class="docs">
-              <summary>中转站怎么调用</summary>
-              <div class="docs-body">
-                <p>用户每天签到领取额度，生图时扣额度。GPT、Nano Banana、Gemini 官方直连的 Key 和剩余余额在 <a href="./admin">管理端</a> 维护。服务端用还有余额的 Key 去请求中转站。</p>
-                <p><strong>GPT 生图</strong>：<code>POST /v1/images/generations</code>，编辑是 <code>/v1/images/edits</code>。先走异步再轮询 <code>/v1/images/tasks/{task_id}</code>，异步不存在时改同步。字段有 <code>model</code>、<code>prompt</code>、<code>size</code>、<code>quality</code>。示例模型 <code>gpt-image-2.5-flare</code>、<code>gpt-image-1</code>。</p>
-                <p><strong>Nano Banana</strong>：同一套生图接口，模型用 <code>gemini-2.5-flash-image</code>（香蕉）、<code>gemini-3-pro-image</code>、<code>gemini-3.1-flash-image</code>。生图接口不收这个模型时，改走 <code>POST /v1/chat/completions</code>，和 UU 控制台对 Gemini 分组的做法一致。</p>
-                <p><strong>GEMINI官方直连-带生图</strong>：<code>POST /v1beta/models/{模型}:generateContent</code>。正文是 Gemini 官方格式，<code>generationConfig.responseModalities</code> 含 <code>IMAGE</code>，画幅和分辨率放在 <code>imageConfig</code>。参考图以 <code>inlineData</code> 放进 <code>contents</code>。</p>
-                <p><strong>Gemini 批量生图</strong>：<code>POST /v1/images/batches</code>，正文是 <code>model</code>、<code>provider</code>、<code>items</code>。之后用 <code>GET /v1/images/batches/{id}</code> 查状态、<code>/items</code> 看条目、<code>/download</code> 取 ZIP，还能 <code>/cancel</code> 取消。这一族要单独配一把「Gemini 批量生图」类型的 Key。</p>
-                <p><strong>蒙版</strong>：图生图时可以用 <code>mask</code> 指定只重绘哪一块。GPT 走 multipart 的 <code>mask</code> 文件字段、或 JSON 的 <code>mask.image_url</code>；Gemini 官方直连没有这个能力。</p>
-              </div>
-            </details>
-          </form>
+        <div class="hero-actions">
+          <a class="btn primary btn-lg" id="startBtn" href="./studio">开始创作</a>
+          <a class="btn btn-lg" href="./admin">管理画坊</a>
         </div>
 
-        <section class="stage" aria-label="生成结果">
-          <div class="card">
-            <div class="card-head">
-              <h3>画案</h3>
-            </div>
-            <div class="frame">
-              <div id="canvas" class="canvas">
-                <p class="empty">描述画面，然后生成。</p>
-              </div>
-            </div>
-            <p id="meta" class="meta" class="spaced"></p>
-            <div id="actions" class="row-actions hidden" class="spaced"></div>
+        <section class="facts" aria-label="画坊三事">
+          <p class="eyebrow">画坊三事</p>
+          <div class="fact-grid">
+            <article class="card fact">
+              <h2>签到领额度</h2>
+              <p>每天签到可领新的画额。轻轻一点，便能再画几幅。</p>
+            </article>
+            <article class="card fact">
+              <h2>GPT 与 Gemini 生图</h2>
+              <p>GPT 生图、Nano Banana 香蕉生图、Gemini 官方直连，四种调用方式。把句子交给暗房。</p>
+            </article>
+            <article class="card fact">
+              <h2>Key 与余额在管理端</h2>
+              <p>画坊钥匙、余额与签到规则，都收在管理页。不打扰创作。</p>
+            </article>
           </div>
-
-          <div class="card">
-            <div class="card-head">
-              <h3>最近</h3>
-            </div>
-            <div id="history" class="history" aria-live="polite"></div>
-          </div>
-        </section>
-
-        <section class="card batch" aria-label="批量生图">
-          <div class="card-head">
-            <h3>批量生图</h3>
-          </div>
-          <p class="hint">走 Gemini 批量接口，一次提交多条。提交时按条目数扣额度，上游受理后不退还。</p>
-
-          <div class="split">
-            <div>
-              <label for="batchModel">模型</label>
-              <input id="batchModel" value="gemini-2.5-flash-image" spellcheck="false" />
-            </div>
-            <div>
-              <label for="batchSize">分辨率</label>
-              <select id="batchSize">
-                <option value="1K">1K</option>
-                <option value="2K">2K</option>
-                <option value="4K">4K</option>
-              </select>
-            </div>
-            <div>
-              <label for="batchProvider">provider</label>
-              <select id="batchProvider">
-                <option value="gemini_api">gemini_api</option>
-                <option value="vertex">vertex</option>
-              </select>
-            </div>
-          </div>
-
-          <label for="batchPrompts">提示词（一行一条）</label>
-          <textarea id="batchPrompts" rows="4" placeholder="A clean product hero image&#10;A lighthouse during a winter storm"></textarea>
-
-          <div class="row-actions spaced">
-            <button type="button" id="batchSubmit" class="primary">提交批量任务</button>
-            <button type="button" id="batchRefresh">刷新列表</button>
-          </div>
-          <p id="batchStatus" class="status" role="status" aria-live="polite"></p>
-          <div id="batchList" class="batches"></div>
         </section>
       </div>
+
+      <footer class="hero-foot">暗房 · 敦煌 · 莫高窟飞天为母题</footer>
     </main>
 
     <script src="./config.js"></script>
-    <script src="./app.js"></script>
+    <script src="./landing.js"></script>
   </body>
 </html>

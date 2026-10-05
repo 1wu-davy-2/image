@@ -11,7 +11,7 @@
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@500;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
-  <body>
+  <body class="admin-page">
     <header class="top">
       <div class="top-inner">
         <div class="brand">
@@ -19,7 +19,8 @@
           <h1>暗房 · 管理端</h1>
         </div>
         <nav class="nav">
-          <a href="./"><span>创作</span></a>
+          <a href="./"><span>介绍</span></a>
+          <a href="./studio"><span>创作</span></a>
           <a href="./admin" aria-current="page"><span>管理</span></a>
         </nav>
       </div>
@@ -35,7 +36,7 @@
       </div>
     </header>
 
-    <main class="wrap">
+    <main class="admin-body">
       <form id="loginView" class="card narrow">
         <div class="page-head center">
           <p class="eyebrow">管理</p>
@@ -53,141 +54,170 @@
       </form>
 
       <div id="appView" class="hidden">
-        <div class="page-head">
-          <p class="eyebrow">管理</p>
-          <h2>账房</h2>
-          <p>签到规则、生图 Key 与余额、用户额度都在这里维护。</p>
-        </div>
+        <div class="shell admin-shell">
+          <aside class="sidebar admin-side">
+            <p class="eyebrow sidebar-title">管理</p>
+            <nav class="sidebar-nav" id="adminNav">
+              <a class="sidebar-link" href="#users" data-panel="users"><span>用户管理</span></a>
+              <a class="sidebar-link" href="#keys" data-panel="keys"><span>API 管理</span></a>
+              <a class="sidebar-link" href="#checkin" data-panel="checkin"><span>签到</span></a>
+            </nav>
 
-        <div class="stack">
-          <section class="card">
-            <div class="card-head">
-              <h3>签到规则</h3>
-              <button type="button" id="logoutBtn" class="ghost">退出</button>
-            </div>
-            <div class="split">
-              <div>
-                <label for="checkinQuota">每日签到领取额度</label>
-                <input id="checkinQuota" type="number" min="0" max="1000" step="1" />
-              </div>
-              <div>
-                <label for="generateCost">每次生图消耗额度</label>
-                <input id="generateCost" type="number" min="0" max="1000" step="1" />
-              </div>
-            </div>
-            <div class="row-actions spaced">
-              <button type="button" id="saveSettings" class="primary">保存规则</button>
+            <div class="sidebar-quota">
+              <p class="eyebrow">概览</p>
+              <p class="sidebar-quota-number" id="statUsers">0</p>
+              <p class="hint">位用户</p>
+              <p class="hint" id="statKeys">生图 Key 0 把</p>
             </div>
 
-            <div class="hairline"></div>
-
-            <form id="passwordForm" class="split">
-              <div>
-                <label for="oldPassword">原管理密码</label>
-                <input id="oldPassword" type="password" autocomplete="current-password" />
-              </div>
-              <div>
-                <label for="newPassword">新管理密码</label>
-                <input id="newPassword" type="password" autocomplete="new-password" />
-              </div>
-              <div class="check-line">
-                <button type="submit">修改密码</button>
-              </div>
-            </form>
-            <p id="settingsStatus" class="status" role="status"></p>
-          </section>
-
-          <section class="card">
-            <div class="card-head">
-              <h3>生图 Key</h3>
+            <div class="admin-side-foot">
+              <button type="button" id="logoutBtn" class="sidebar-action">退出管理端</button>
             </div>
-            <form id="keyForm">
-              <input id="keyId" type="hidden" />
-              <div class="split">
-                <div>
-                  <label for="keyName">名称</label>
-                  <input id="keyName" maxlength="40" required placeholder="例如：官方直连 1" />
+          </aside>
+
+          <main class="shell-main">
+            <section class="admin-panel" data-panel="users">
+              <div class="page-head">
+                <p class="eyebrow">管理</p>
+                <h2>用户管理</h2>
+                <p>改额度、重置密码、停用或删除。停用和重置密码都会立刻踢掉该用户已经登录的会话。</p>
+              </div>
+              <div class="card">
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>用户</th>
+                        <th>额度</th>
+                        <th>上次签到</th>
+                        <th>状态</th>
+                        <th>操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="userRows"></tbody>
+                  </table>
                 </div>
-                <div>
-                  <label for="keyProtocol">类型</label>
-                  <select id="keyProtocol">
-                    <option value="gpt">GPT 生图</option>
-                    <option value="nano">Nano Banana 香蕉生图</option>
-                    <option value="gemini-official">GEMINI官方直连-带生图</option>
-                    <option value="gemini-batch">Gemini 批量生图</option>
-                  </select>
-                </div>
+                <p id="userStatus" class="status" role="status"></p>
               </div>
-              <label for="keyBase">中转地址</label>
-              <input id="keyBase" type="url" required spellcheck="false" value="https://uuapi.io/v1" />
-              <div class="row-actions tight">
-                <button type="button" class="small" data-origin="https://uuapi.io">uuapi.io</button>
-                <button type="button" class="small" data-origin="https://uuapi.cc">uuapi.cc</button>
-                <button type="button" class="small" data-origin="https://uuapi.net">uuapi.net</button>
-              </div>
-              <label for="keySecret">API Key</label>
-              <input id="keySecret" type="password" autocomplete="off" spellcheck="false" placeholder="新建时必填，编辑时留空表示不改" />
-              <label for="keyAgent">请求头 User-Agent</label>
-              <input id="keyAgent" maxlength="200" spellcheck="false" placeholder="留空则用 darkroom/1.0 (local image studio)" />
-              <div class="row-actions tight">
-                <button type="button" class="small" data-agent="claude-cli/2.0.76 (external, cli)">Claude CLI</button>
-                <button type="button" class="small" data-agent="codex_cli_rs/0.77.0 (Windows 10.0.26100; x86_64) WindowsTerminal">Codex CLI</button>
-                <button type="button" class="small" data-agent="">用默认</button>
-              </div>
-              <div class="split">
-                <div>
-                  <label for="keyBalance">剩余余额</label>
-                  <input id="keyBalance" type="number" step="0.0001" placeholder="留空表示尚未查询" />
-                </div>
-                <div class="check-line">
-                  <label><input id="keyEnabled" type="checkbox" checked /> 启用</label>
-                </div>
-              </div>
-              <label for="keyNote">备注</label>
-              <input id="keyNote" maxlength="200" />
-              <div class="row-actions spaced-lg">
-                <button type="submit" id="saveKey" class="primary">保存 Key</button>
-                <button type="button" id="resetKey">清空，改为新建</button>
-              </div>
-            </form>
-            <p id="keyStatus" class="status" role="status"></p>
+            </section>
 
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>名称</th>
-                    <th>类型</th>
-                    <th>剩余余额</th>
-                    <th>状态</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody id="keyRows"></tbody>
-              </table>
-            </div>
-          </section>
+            <section class="admin-panel hidden" data-panel="keys">
+              <div class="page-head">
+                <p class="eyebrow">管理</p>
+                <h2>API 管理</h2>
+                <p>按调用方式分组维护中转站的 Key 与余额。生图时优先挑余额多的、最近没怎么用过的。</p>
+              </div>
+              <div class="card">
+                <h3>生图 Key</h3>
+                <form id="keyForm">
+                <input id="keyId" type="hidden" />
+                <div class="split">
+                  <div>
+                    <label for="keyName">名称</label>
+                    <input id="keyName" maxlength="40" required placeholder="例如：官方直连 1" />
+                  </div>
+                  <div>
+                    <label for="keyProtocol">类型</label>
+                    <select id="keyProtocol">
+                      <option value="gpt">GPT 生图</option>
+                      <option value="nano">Nano Banana 香蕉生图</option>
+                      <option value="gemini-official">GEMINI官方直连-带生图</option>
+                      <option value="gemini-batch">Gemini 批量生图</option>
+                    </select>
+                  </div>
+                </div>
+                <label for="keyBase">中转地址</label>
+                <input id="keyBase" type="url" required spellcheck="false" value="https://uuapi.io/v1" />
+                <div class="row-actions tight">
+                  <button type="button" class="small" data-origin="https://uuapi.io">uuapi.io</button>
+                  <button type="button" class="small" data-origin="https://uuapi.cc">uuapi.cc</button>
+                  <button type="button" class="small" data-origin="https://uuapi.net">uuapi.net</button>
+                </div>
+                <label for="keySecret">API Key</label>
+                <input id="keySecret" type="password" autocomplete="off" spellcheck="false" placeholder="新建时必填，编辑时留空表示不改" />
+                <label for="keyAgent">请求头 User-Agent</label>
+                <input id="keyAgent" maxlength="200" spellcheck="false" placeholder="留空则用 darkroom/1.0 (local image studio)" />
+                <div class="row-actions tight">
+                  <button type="button" class="small" data-agent="claude-cli/2.0.76 (external, cli)">Claude CLI</button>
+                  <button type="button" class="small" data-agent="codex_cli_rs/0.77.0 (Windows 10.0.26100; x86_64) WindowsTerminal">Codex CLI</button>
+                  <button type="button" class="small" data-agent="">用默认</button>
+                </div>
+                <div class="split">
+                  <div>
+                    <label for="keyBalance">剩余余额</label>
+                    <input id="keyBalance" type="number" step="0.0001" placeholder="留空表示尚未查询" />
+                  </div>
+                  <div class="check-line">
+                    <label><input id="keyEnabled" type="checkbox" checked /> 启用</label>
+                  </div>
+                </div>
+                <label for="keyNote">备注</label>
+                <input id="keyNote" maxlength="200" />
+                <div class="row-actions spaced-lg">
+                  <button type="submit" id="saveKey" class="primary">保存 Key</button>
+                  <button type="button" id="resetKey">清空，改为新建</button>
+                </div>
+              </form>
+              <p id="keyStatus" class="status" role="status"></p>
+  
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>名称</th>
+                      <th>类型</th>
+                      <th>剩余余额</th>
+                      <th>状态</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="keyRows"></tbody>
+                </table>
+              </div>
+              </div>
+            </section>
 
-          <section class="card">
-            <div class="card-head">
-              <h3>用户</h3>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>用户</th>
-                    <th>额度</th>
-                    <th>上次签到</th>
-                    <th>状态</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody id="userRows"></tbody>
-              </table>
-            </div>
-            <p id="userStatus" class="status" role="status"></p>
-          </section>
+            <section class="admin-panel hidden" data-panel="checkin">
+              <div class="page-head">
+                <p class="eyebrow">管理</p>
+                <h2>签到</h2>
+                <p>每天签到领多少额度、每次生图扣多少额度，以及管理端自己的密码。</p>
+              </div>
+              <div class="card">
+                <h3>签到规则</h3>
+                <div class="split">
+                  <div>
+                    <label for="checkinQuota">每日签到领取额度</label>
+                    <input id="checkinQuota" type="number" min="0" max="1000" step="1" />
+                  </div>
+                  <div>
+                    <label for="generateCost">每次生图消耗额度</label>
+                    <input id="generateCost" type="number" min="0" max="1000" step="1" />
+                  </div>
+                </div>
+                <div class="row-actions spaced">
+                  <button type="button" id="saveSettings" class="primary">保存规则</button>
+                </div>
+
+                <div class="hairline"></div>
+
+                <form id="passwordForm" class="split">
+                  <div>
+                    <label for="oldPassword">原管理密码</label>
+                    <input id="oldPassword" type="password" autocomplete="current-password" />
+                  </div>
+                  <div>
+                    <label for="newPassword">新管理密码</label>
+                    <input id="newPassword" type="password" autocomplete="new-password" />
+                  </div>
+                  <div class="check-line">
+                    <button type="submit">修改密码</button>
+                  </div>
+                </form>
+                <p id="settingsStatus" class="status" role="status"></p>
+              </div>
+            </section>
+          </main>
         </div>
       </div>
     </main>
