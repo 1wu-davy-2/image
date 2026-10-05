@@ -21,12 +21,15 @@
 ## 数据模型
 
 ```
-User      id, username, quota, disabled, lastCheckinDate(YYYY-MM-DD, 北京时区), createdAt
+User      id, username, displayName, phone, email, quota, disabled, isAdmin,
+          lastCheckinDate(YYYY-MM-DD, 北京时区), createdAt
 Key       id, name, protocol, baseUrl, apiKey, userAgent,
           balance(数字或 null), balanceUnit, balanceValid(true/false/null),
           balanceUpdatedAt, balanceError, enabled, note, lastUsedAt
 Settings  checkinQuota(0-1000 整数), generateCost(0-1000 整数)
 Admin     username, 密码哈希(scrypt + salt)
+Generation  id, username, displayName, prompt, protocol, model, sizeLabel, channel,
+          taskId, isPublic, mine, createdAt, images[{position, mime}]
 ```
 
 `protocol` 四选一：`gpt`、`nano`、`gemini-official`、`gemini-batch`。
@@ -35,14 +38,33 @@ Admin     username, 密码哈希(scrypt + salt)
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/auth/register` | 注册并登录。body `{username, password}`，用户名 2-20 位字母数字下划线，密码 6-72 位 |
-| `POST` | `/api/auth/login` | 登录。被停用的账号返回 403 |
+| `POST` | `/api/auth/register` | 注册并登录。body `{username, displayName?, password, phone, email}`，字段规则见下 |
+| `POST` | `/api/auth/login` | 登录。body `{account, password}`，`account` 名称或邮箱都收。被停用的账号返回 403 |
 | `POST` | `/api/auth/logout` | 退出，清 Cookie |
 | `GET` | `/api/me` | 未登录也返回 200：`{ok, user: null 或用户对象, checkinQuota, generateCost}` |
 | `POST` | `/api/checkin` | 签到。同一天重复签到返回 400 |
 | `POST` | `/api/me/password` | 改自己的密码。body `{oldPassword, newPassword}`，原密码错返回 401 |
+| `PATCH` | `/api/me` | 改中文名。body `{displayName}`，最多 24 字，超了 400 |
 | `POST` | `/api/generate` | 生图，见下 |
+| `GET` | `/api/generations` | 自己的作品集。`limit`（默认 24，上限 100）、`offset` |
+| `GET` | `/api/generations/{id}` | 作品详情。自己的，或已公开的；其余一律 404 |
+| `PATCH` | `/api/generations/{id}` | 公开 / 取消公开。body `{isPublic}`，不是布尔值返回 400 |
+| `DELETE` | `/api/generations/{id}` | 删除自己的作品 |
+| `GET` | `/api/generations/{id}/images/{position}` | 作品图片，原始字节。字节还没拉回来时 302 到上游链接 |
+| `GET` | `/api/works` | 公开作品。不登录也能看，登录了会标出 `mine` |
 | `/api/batches...` | | 批量生图，见下 |
+
+### 注册字段规则
+
+| 字段 | 必填 | 规则 |
+| --- | --- | --- |
+| `username` | 是 | 2–20 位，只能英文字母和数字。不区分大小写唯一，重复返回 409 |
+| `displayName` | 否 | 中文名，最多 24 个字 |
+| `password` | 是 | 至少 8 位，最多 72 位 |
+| `phone` | 是 | 11 位大陆手机号（1 开头、第二位 3–9）。不查重 |
+| `email` | 是 | 基本格式校验。不区分大小写唯一，重复返回 409；可当 `account` 登录 |
+
+字段不合法一律 400，文案里带具体原因。
 
 ### POST /api/generate
 

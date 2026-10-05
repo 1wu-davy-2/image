@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -107,6 +108,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/login", s.wrap(s.login))
 	mux.HandleFunc("POST /api/auth/logout", s.wrap(s.logout))
 	mux.HandleFunc("GET /api/me", s.wrap(s.me))
+	mux.HandleFunc("PATCH /api/me", s.wrap(s.updateMe))
 	mux.HandleFunc("POST /api/checkin", s.wrap(s.checkin))
 	mux.HandleFunc("POST /api/me/password", s.wrap(s.changeMyPassword))
 	mux.HandleFunc("POST /api/generate", s.wrap(s.generateHandler))
@@ -121,6 +123,14 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/batches/{id}/outputs", s.wrap(s.batchDelete("/outputs")))
 	mux.HandleFunc("GET /api/batches/{id}/download", s.wrap(s.batchRaw("/download")))
 	mux.HandleFunc("GET /api/batches/{id}/items/{customID}/content", s.wrap(s.batchItemContent))
+
+	// 作品集（自己的）与公开作品。
+	mux.HandleFunc("GET /api/generations", s.wrap(s.generationList))
+	mux.HandleFunc("GET /api/generations/{id}", s.wrap(s.generationDetail))
+	mux.HandleFunc("DELETE /api/generations/{id}", s.wrap(s.generationDelete))
+	mux.HandleFunc("PATCH /api/generations/{id}", s.wrap(s.generationPatch))
+	mux.HandleFunc("GET /api/generations/{id}/images/{position}", s.wrap(s.generationImageRaw))
+	mux.HandleFunc("GET /api/works", s.wrap(s.publicWorkList))
 
 	mux.HandleFunc("POST /api/admin/login", s.wrap(s.adminLogin))
 	mux.HandleFunc("POST /api/admin/logout", s.wrap(s.adminLogout))
@@ -473,7 +483,13 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	user, token, err := s.store.register(firstString(body["username"]), firstString(body["password"]))
+	user, token, err := s.store.register(RegisterInput{
+		Username:    firstString(body["username"]),
+		DisplayName: firstString(body["displayName"]),
+		Password:    firstString(body["password"]),
+		Phone:       firstString(body["phone"]),
+		Email:       firstString(body["email"]),
+	})
 	if err != nil {
 		return err
 	}
@@ -486,11 +502,30 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	user, token, err := s.store.login(firstString(body["username"]), firstString(body["password"]))
+	// account 既收名称也收邮箱。
+	user, token, err := s.store.login(firstString(body["account"]), firstString(body["password"]))
 	if err != nil {
 		return err
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "user": user}, sessionCookie(userCookieName, token))
+	return nil
+}
+
+// 目前只有中文名可改；名称、手机号、邮箱定了就不让动。
+func (s *server) updateMe(w http.ResponseWriter, r *http.Request) error {
+	user, err := s.requireUser(r)
+	if err != nil {
+		return err
+	}
+	body, err := readJSON(w, r)
+	if err != nil {
+		return err
+	}
+	updated, err := s.store.setUserDisplayName(user.ID, firstString(body["displayName"]))
+	if err != nil {
+		return err
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "user": updated})
 	return nil
 }
 
@@ -586,6 +621,24 @@ func (s *server) generateHandler(w http.ResponseWriter, r *http.Request) error {
 		return genErr
 	}
 	log.Printf("[generate] %s protocol=%s model=%s images=%d", result.Channel, protocol, spec.Model, len(result.Images))
+
+	// 落库，作品集和公开作品都靠它。存不下也不影响这次生成的结果。
+	if record, err := s.store.saveGeneration(GenerationInput{
+		UserID:    user.ID,
+		Prompt:    spec.Prompt,
+		Protocol:  protocol,
+		Model:     spec.Model,
+		SizeLabel: specSizeLabel(spec),
+		Channel:   result.Channel,
+		TaskID:    result.TaskID,
+		Images:    collectStoredImages(result.Images),
+	}); err != nil {
+		log.Printf("[gallery] 保存生成记录失败：%v", err)
+	} else {
+		// 只有链接的图放到后台去拉，别让用户等下载。
+		go s.store.fillGenerationImages(record.ID)
+	}
+
 	writeJSON(w, 200, map[string]any{
 		"ok":      true,
 		"channel": result.Channel,
@@ -594,6 +647,190 @@ func (s *server) generateHandler(w http.ResponseWriter, r *http.Request) error {
 		"quota":   quota,
 	})
 	return nil
+}
+
+func specSizeLabel(spec generateSpec) string {
+	parts := []string{}
+	for _, part := range []string{spec.Size, spec.Quality, spec.AspectRatio, spec.ImageSize} {
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+// collectStoredImages 把上游回来的图整理成待落库的形状：base64 的直接带上字节，
+// 只有链接的先留链接，由 fillGenerationImages 在后台补拉。
+func collectStoredImages(images []imageResult) []StoredImage {
+	out := make([]StoredImage, 0, len(images))
+	for _, image := range images {
+		switch {
+		case image.B64 != "":
+			data, err := base64.StdEncoding.DecodeString(image.B64)
+			if err != nil {
+				continue
+			}
+			mime := image.Mime
+			if mime == "" {
+				mime = sniffMime(image.B64)
+			}
+			out = append(out, StoredImage{Mime: mime, Data: data})
+		case image.URL != "":
+			out = append(out, StoredImage{Mime: image.Mime, URL: image.URL})
+		}
+	}
+	return out
+}
+
+/* ---------- 作品集与公开作品 ---------- */
+
+const (
+	pageLimitDefault = 24
+	pageLimitMax     = 100
+)
+
+func pageParams(r *http.Request) (int, int) {
+	limit := pageLimitDefault
+	if value, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && value > 0 {
+		limit = value
+		if limit > pageLimitMax {
+			limit = pageLimitMax
+		}
+	}
+	offset := 0
+	if value, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && value > 0 {
+		offset = value
+	}
+	return limit, offset
+}
+
+func (s *server) generationList(w http.ResponseWriter, r *http.Request) error {
+	user, err := s.requireUser(r)
+	if err != nil {
+		return err
+	}
+	limit, offset := pageParams(r)
+	list, total, err := s.store.generationsByUser(user.ID, limit, offset)
+	if err != nil {
+		return err
+	}
+	for i := range list {
+		list[i].Mine = true
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "items": list, "total": total})
+	return nil
+}
+
+// 公开作品不登录也能看；登录了就顺手标出哪些是自己的。
+func (s *server) publicWorkList(w http.ResponseWriter, r *http.Request) error {
+	user, err := s.store.sessionUser(cookieValue(r, userCookieName))
+	if err != nil {
+		return err
+	}
+	limit, offset := pageParams(r)
+	list, total, err := s.store.publicGenerations(limit, offset)
+	if err != nil {
+		return err
+	}
+	for i := range list {
+		list[i].Mine = user != nil && list[i].userID == user.ID
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "items": list, "total": total})
+	return nil
+}
+
+func (s *server) generationDetail(w http.ResponseWriter, r *http.Request) error {
+	user, err := s.store.sessionUser(cookieValue(r, userCookieName))
+	if err != nil {
+		return err
+	}
+	item, err := s.store.generationByID(r.PathValue("id"))
+	if err != nil {
+		return err
+	}
+	mine := user != nil && item.userID == user.ID
+	if !item.IsPublic && !mine {
+		// 不区分「不存在」和「不是你的」，免得能拿来探别人有哪些作品。
+		return fail(404, "找不到这条作品")
+	}
+	item.Mine = mine
+	writeJSON(w, 200, map[string]any{"ok": true, "item": item})
+	return nil
+}
+
+func (s *server) generationDelete(w http.ResponseWriter, r *http.Request) error {
+	user, err := s.requireUser(r)
+	if err != nil {
+		return err
+	}
+	if err := s.store.deleteGeneration(r.PathValue("id"), user.ID); err != nil {
+		return err
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+	return nil
+}
+
+func (s *server) generationPatch(w http.ResponseWriter, r *http.Request) error {
+	user, err := s.requireUser(r)
+	if err != nil {
+		return err
+	}
+	body, err := readJSON(w, r)
+	if err != nil {
+		return err
+	}
+	isPublic, ok := body["isPublic"].(bool)
+	if !ok {
+		return fail(400, "isPublic 需要是 true 或 false")
+	}
+	item, err := s.store.setGenerationPublic(r.PathValue("id"), user.ID, isPublic)
+	if err != nil {
+		return err
+	}
+	item.Mine = true
+	writeJSON(w, 200, map[string]any{"ok": true, "item": item})
+	return nil
+}
+
+func (s *server) generationImageRaw(w http.ResponseWriter, r *http.Request) error {
+	user, err := s.store.sessionUser(cookieValue(r, userCookieName))
+	if err != nil {
+		return err
+	}
+	id := r.PathValue("id")
+	item, err := s.store.generationByID(id)
+	if err != nil {
+		return err
+	}
+	if !item.IsPublic && (user == nil || item.userID != user.ID) {
+		return fail(404, "找不到这张图")
+	}
+	position, err := strconv.Atoi(r.PathValue("position"))
+	if err != nil {
+		return fail(400, "图片序号不对")
+	}
+	mime, data, sourceURL, err := s.store.generationImage(id, position)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		// 还没拉回来，或者拉失败。把人送回上游链接，总比空框强。
+		if sourceURL == "" {
+			return fail(404, "这张图没有内容")
+		}
+		http.Redirect(w, r, sourceURL, http.StatusFound)
+		return nil
+	}
+	if mime == "" {
+		mime = "image/png"
+	}
+	w.Header().Set("Content-Type", mime)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(200)
+	_, err = w.Write(data)
+	return err
 }
 
 func buildSpec(ctx context.Context, body map[string]any, protocol string) (generateSpec, error) {

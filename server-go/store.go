@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"database/sql"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -33,8 +35,12 @@ func todayShanghai() string { return time.Now().In(shanghai).Format("2006-01-02"
 type User struct {
 	ID              string `json:"id"`
 	Username        string `json:"username"`
+	DisplayName     string `json:"displayName"`
+	Phone           string `json:"phone"`
+	Email           string `json:"email"`
 	Quota           int    `json:"quota"`
 	Disabled        bool   `json:"disabled"`
+	IsAdmin         bool   `json:"isAdmin"`
 	LastCheckinDate string `json:"lastCheckinDate"`
 	CheckedInToday  bool   `json:"checkedInToday"`
 	CreatedAt       string `json:"createdAt"`
@@ -109,10 +115,15 @@ CREATE TABLE IF NOT EXISTS users (
   id                TEXT PRIMARY KEY,
   username          TEXT NOT NULL,
   username_lower    TEXT NOT NULL UNIQUE,
+  display_name      TEXT NOT NULL DEFAULT '',
+  phone             TEXT NOT NULL DEFAULT '',
+  email             TEXT NOT NULL DEFAULT '',
+  email_lower       TEXT NOT NULL DEFAULT '',
   salt              BLOB NOT NULL,
   hash              BLOB NOT NULL,
   quota             INTEGER NOT NULL DEFAULT 0,
   disabled          INTEGER NOT NULL DEFAULT 0,
+  is_admin          INTEGER NOT NULL DEFAULT 0,
   last_checkin_date TEXT NOT NULL DEFAULT '',
   created_at        TEXT NOT NULL
 );
@@ -140,9 +151,81 @@ CREATE TABLE IF NOT EXISTS keys (
   last_used_at       INTEGER NOT NULL DEFAULT 0,
   created_at         TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS generations (
+  id          TEXT PRIMARY KEY,
+  user_id     TEXT NOT NULL,
+  prompt      TEXT NOT NULL,
+  protocol    TEXT NOT NULL,
+  model       TEXT NOT NULL,
+  size_label  TEXT NOT NULL DEFAULT '',
+  channel     TEXT NOT NULL DEFAULT '',
+  task_id     TEXT NOT NULL DEFAULT '',
+  is_public   INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS generations_user ON generations(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS generations_public ON generations(is_public, created_at DESC);
+CREATE TABLE IF NOT EXISTS generation_images (
+  id            TEXT PRIMARY KEY,
+  generation_id TEXT NOT NULL,
+  position      INTEGER NOT NULL,
+  mime          TEXT NOT NULL DEFAULT '',
+  source_url    TEXT NOT NULL DEFAULT '',
+  bytes         BLOB
+);
+CREATE INDEX IF NOT EXISTS generation_images_gen ON generation_images(generation_id, position);
 INSERT OR IGNORE INTO settings (id, checkin_quota, generate_cost) VALUES (1, 5, 1);
 `)
+	if err != nil {
+		return err
+	}
+	// 老库补列：SQLite 没有 ADD COLUMN IF NOT EXISTS，先查 PRAGMA 再补。
+	if err := s.addMissingColumns("users", [][2]string{
+		{"display_name", "TEXT NOT NULL DEFAULT ''"},
+		{"phone", "TEXT NOT NULL DEFAULT ''"},
+		{"email", "TEXT NOT NULL DEFAULT ''"},
+		{"email_lower", "TEXT NOT NULL DEFAULT ''"},
+		{"is_admin", "INTEGER NOT NULL DEFAULT 0"},
+	}); err != nil {
+		return err
+	}
+	// 邮箱要能当登录名，所以唯一。老库补列留下的空串不参与唯一，故用条件索引。
+	_, err = s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email_lower) WHERE email_lower <> ''`)
 	return err
+}
+
+// addMissingColumns 给已存在的表补上后加的列。
+func (s *Store) addMissingColumns(table string, columns [][2]string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	existing := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, ctype      string
+			dflt             any
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, column := range columns {
+		if existing[column[0]] {
+			continue
+		}
+		if _, err := s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column[0] + ` ` + column[1]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 /* ---------- 小工具 ---------- */
@@ -179,6 +262,26 @@ func (s *Store) now() string { return time.Now().UTC().Format(time.RFC3339) }
 /* ---------- 启动时准备管理员 ---------- */
 
 func (s *Store) ensureAdmin() error {
+	if err := s.ensureAdminRow(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 管理端账号在用户表里可能已经有一行（登过用户端就会有），补上管理员标志。
+	// 不能靠「名字等于 admin」来判断：管理员没登过用户端时，这个名字是能被抢注的。
+	var name string
+	if err := s.db.QueryRow(`SELECT username FROM admin WHERE id = 1`).Scan(&name); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE users SET is_admin = 1 WHERE username_lower = ?`,
+		strings.ToLower(strings.TrimSpace(name)))
+	return err
+}
+
+func (s *Store) ensureAdminRow() error {
 	username := strings.TrimSpace(os.Getenv("ADMIN_USER"))
 	if username == "" {
 		username = defaultAdminUser
@@ -259,12 +362,13 @@ func (s *Store) updateSettings(checkin, cost int) (Settings, error) {
 
 /* ---------- 用户 ---------- */
 
+// 名称只收英文字母和数字，所以按字节数就是字数。
 func validUsername(name string) bool {
-	if len([]rune(name)) < 2 || len([]rune(name)) > 20 {
+	if len(name) < 2 || len(name) > 20 {
 		return false
 	}
 	for _, r := range name {
-		if r == '_' || r == '-' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r > 127 {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
 			continue
 		}
 		return false
@@ -274,33 +378,82 @@ func validUsername(name string) bool {
 
 func validPassword(password string) bool {
 	n := len([]rune(password))
-	return n >= 6 && n <= 72
+	return n >= 8 && n <= 72
+}
+
+// 中文名是可选的，填了就别太长。
+func validDisplayName(name string) bool {
+	return len([]rune(name)) <= 24
+}
+
+// 大陆手机号：1 开头、第二位 3-9、共 11 位。
+func validPhone(phone string) bool {
+	if len(phone) != 11 || phone[0] != '1' || phone[1] < '3' || phone[1] > '9' {
+		return false
+	}
+	for _, r := range phone {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// 邮箱只校验基本形状：本地部分@域名，域名至少带一个点。
+var emailPattern = regexp.MustCompile(`^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$`)
+
+func validEmail(email string) bool {
+	return len(email) <= 254 && emailPattern.MatchString(email)
 }
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var user User
-	var disabled int
+	var disabled, isAdmin int
 	var quota sql.NullInt64
-	err := row.Scan(&user.ID, &user.Username, &quota, &disabled, &user.LastCheckinDate, &user.CreatedAt)
+	err := row.Scan(&user.ID, &user.Username, &user.DisplayName, &user.Phone, &user.Email,
+		&quota, &disabled, &isAdmin, &user.LastCheckinDate, &user.CreatedAt)
 	if err != nil {
 		return user, err
 	}
 	user.Quota = int(quota.Int64)
 	user.Disabled = disabled != 0
+	user.IsAdmin = isAdmin != 0
 	user.CheckedInToday = user.LastCheckinDate == todayShanghai()
 	return user, nil
 }
 
-const userColumns = `id, username, quota, disabled, last_checkin_date, created_at`
+const userColumns = `id, username, display_name, phone, email, quota, disabled, is_admin, last_checkin_date, created_at`
 
-func (s *Store) register(username, password string) (User, string, error) {
-	name := strings.TrimSpace(username)
+type RegisterInput struct {
+	Username    string
+	DisplayName string
+	Password    string
+	Phone       string
+	Email       string
+}
+
+func (s *Store) register(in RegisterInput) (User, string, error) {
+	name := strings.TrimSpace(in.Username)
+	displayName := strings.TrimSpace(in.DisplayName)
+	phone := strings.TrimSpace(in.Phone)
+	email := strings.TrimSpace(in.Email)
+
 	if !validUsername(name) {
-		return User{}, "", fail(400, "用户名需要 2 到 20 位，可用字母、数字、下划线")
+		return User{}, "", fail(400, "名称需要 2 到 20 位，只能用英文字母和数字")
 	}
-	if !validPassword(password) {
-		return User{}, "", fail(400, "密码需要 6 到 72 位")
+	if !validDisplayName(displayName) {
+		return User{}, "", fail(400, "中文名最多 24 个字")
 	}
+	if !validPassword(in.Password) {
+		return User{}, "", fail(400, "密码至少 8 位")
+	}
+	if !validPhone(phone) {
+		return User{}, "", fail(400, "手机号要填 11 位的大陆号码")
+	}
+	if !validEmail(email) {
+		return User{}, "", fail(400, "邮箱格式不对")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -309,13 +462,21 @@ func (s *Store) register(username, password string) (User, string, error) {
 		return User{}, "", err
 	}
 	if existing > 0 {
-		return User{}, "", fail(409, "这个用户名已经注册过")
+		return User{}, "", fail(409, "这个名称已经注册过")
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE email_lower = ?`, strings.ToLower(email)).Scan(&existing); err != nil {
+		return User{}, "", err
+	}
+	if existing > 0 {
+		return User{}, "", fail(409, "这个邮箱已经注册过")
 	}
 
-	salt, hash := hashPassword(password)
+	salt, hash := hashPassword(in.Password)
 	id := newID()
-	if _, err := s.db.Exec(`INSERT INTO users (id, username, username_lower, salt, hash, quota, disabled, last_checkin_date, created_at)
-		VALUES (?, ?, ?, ?, ?, 0, 0, '', ?)`, id, name, strings.ToLower(name), salt, hash, s.now()); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO users
+		(id, username, username_lower, display_name, phone, email, email_lower, salt, hash, quota, disabled, last_checkin_date, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, '', ?)`,
+		id, name, strings.ToLower(name), displayName, phone, email, strings.ToLower(email), salt, hash, s.now()); err != nil {
 		return User{}, "", err
 	}
 	token, err := s.createSession("user", id)
@@ -326,28 +487,91 @@ func (s *Store) register(username, password string) (User, string, error) {
 	return user, token, err
 }
 
-func (s *Store) login(username, password string) (User, string, error) {
+// account 可以是名称，也可以是邮箱。管理端的账号密码同样能登用户端。
+func (s *Store) login(account, password string) (User, string, error) {
+	key := strings.ToLower(strings.TrimSpace(account))
+	if key == "" {
+		return User{}, "", fail(401, "请填名称或邮箱")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	var id string
 	var disabled int
 	var salt, hash []byte
-	err := s.db.QueryRow(`SELECT id, disabled, salt, hash FROM users WHERE username_lower = ?`, strings.ToLower(strings.TrimSpace(username))).
+	err := s.db.QueryRow(`SELECT id, disabled, salt, hash FROM users WHERE username_lower = ? OR email_lower = ?`, key, key).
 		Scan(&id, &disabled, &salt, &hash)
-	if errors.Is(err, sql.ErrNoRows) || (err == nil && !verifyPassword(password, salt, hash)) {
-		return User{}, "", fail(401, "用户名或密码不对")
+	switch {
+	case err == nil && verifyPassword(password, salt, hash):
+		if disabled != 0 {
+			return User{}, "", fail(403, "这个账号已被停用")
+		}
+		return s.issueUserSession(id)
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return User{}, "", err
+	}
+	// 用户表里没有这个人（或密码不对），再看是不是管理端账号。
+	return s.loginAsAdmin(key, password)
+}
+
+// 管理端账号登用户端：第一次成功时补一条用户记录，之后就走普通用户那一套
+// ——额度、签到、生图都需要 users 表里有行。
+func (s *Store) loginAsAdmin(key, password string) (User, string, error) {
+	var name string
+	var salt, hash []byte
+	err := s.db.QueryRow(`SELECT username, salt, hash FROM admin WHERE id = 1`).Scan(&name, &salt, &hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, "", fail(401, "名称或密码不对")
 	}
 	if err != nil {
 		return User{}, "", err
 	}
-	if disabled != 0 {
+	if strings.ToLower(strings.TrimSpace(name)) != key || !verifyPassword(password, salt, hash) {
+		return User{}, "", fail(401, "名称或密码不对")
+	}
+
+	user, err := s.ensureUserForAdmin(name, password)
+	if err != nil {
+		return User{}, "", err
+	}
+	if user.Disabled {
 		return User{}, "", fail(403, "这个账号已被停用")
 	}
-	token, err := s.createSession("user", id)
+	return s.issueUserSession(user.ID)
+}
+
+func (s *Store) ensureUserForAdmin(name, password string) (User, error) {
+	var id string
+	err := s.db.QueryRow(`SELECT id FROM users WHERE username_lower = ?`, strings.ToLower(name)).Scan(&id)
+	switch {
+	case err == nil:
+		// 已经有行了（比如自己先注册过同名账号），补上管理员标志。
+		if _, err := s.db.Exec(`UPDATE users SET is_admin = 1 WHERE id = ?`, id); err != nil {
+			return User{}, err
+		}
+		return s.userByID(id)
+	case !errors.Is(err, sql.ErrNoRows):
+		return User{}, err
+	}
+
+	salt, hash := hashPassword(password)
+	id = newID()
+	// 手机号和邮箱留空：这是内部补的行，不占用唯一邮箱，也走不了邮箱登录。
+	if _, err := s.db.Exec(`INSERT INTO users
+		(id, username, username_lower, display_name, phone, email, email_lower, salt, hash, quota, disabled, is_admin, last_checkin_date, created_at)
+		VALUES (?, ?, ?, '管理端', '', '', '', ?, ?, 0, 0, 1, '', ?)`,
+		id, name, strings.ToLower(name), salt, hash, s.now()); err != nil {
+		return User{}, err
+	}
+	return s.userByID(id)
+}
+
+func (s *Store) issueUserSession(userID string) (User, string, error) {
+	token, err := s.createSession("user", userID)
 	if err != nil {
 		return User{}, "", err
 	}
-	user, err := s.userByID(id)
+	user, err := s.userByID(userID)
 	return user, token, err
 }
 
@@ -864,5 +1088,282 @@ func sortKeys(list []Key, less func(a, b Key) bool) {
 		for j := i; j > 0 && less(list[j], list[j-1]); j-- {
 			list[j], list[j-1] = list[j-1], list[j]
 		}
+	}
+}
+
+/* ---------- 作品：生成记录与公开作品 ---------- */
+
+type GenerationImage struct {
+	Position int    `json:"position"`
+	Mime     string `json:"mime"`
+}
+
+// Generation 是一条生成记录。图片本体不在这里，走
+// /api/generations/{id}/images/{position} 单独取。
+type Generation struct {
+	ID          string            `json:"id"`
+	Username    string            `json:"username"`
+	DisplayName string            `json:"displayName"`
+	Prompt      string            `json:"prompt"`
+	Protocol    string            `json:"protocol"`
+	Model       string            `json:"model"`
+	SizeLabel   string            `json:"sizeLabel"`
+	Channel     string            `json:"channel"`
+	TaskID      string            `json:"taskId"`
+	IsPublic    bool              `json:"isPublic"`
+	Mine        bool              `json:"mine"`
+	CreatedAt   string            `json:"createdAt"`
+	Images      []GenerationImage `json:"images"`
+
+	// 不给前端，只在算 Mine 和鉴权时用。
+	userID string
+}
+
+// StoredImage 是准备落库的一张图。Data 为 nil 时只留 URL，
+// 后台再补拉（见 fillGenerationImages）。
+type StoredImage struct {
+	Mime string
+	Data []byte
+	URL  string
+}
+
+type GenerationInput struct {
+	UserID    string
+	Prompt    string
+	Protocol  string
+	Model     string
+	SizeLabel string
+	Channel   string
+	TaskID    string
+	Images    []StoredImage
+}
+
+const generationFrom = `FROM generations g LEFT JOIN users u ON u.id = g.user_id`
+
+const generationColumns = `g.id, g.prompt, g.protocol, g.model, g.size_label, g.channel,
+	g.task_id, g.is_public, g.created_at, COALESCE(u.username, ''), COALESCE(u.display_name, ''), g.user_id`
+
+func scanGeneration(row interface{ Scan(...any) error }) (Generation, error) {
+	var out Generation
+	var isPublic int
+	if err := row.Scan(&out.ID, &out.Prompt, &out.Protocol, &out.Model, &out.SizeLabel, &out.Channel,
+		&out.TaskID, &isPublic, &out.CreatedAt, &out.Username, &out.DisplayName, &out.userID); err != nil {
+		return out, err
+	}
+	out.IsPublic = isPublic != 0
+	out.Images = []GenerationImage{}
+	return out, nil
+}
+
+// 图片单独一次查出来，省得列表里每条都挂一个子查询。
+func (s *Store) attachImages(list []Generation) error {
+	if len(list) == 0 {
+		return nil
+	}
+	index := make(map[string]int, len(list))
+	marks := make([]string, 0, len(list))
+	args := make([]any, 0, len(list))
+	for i, item := range list {
+		index[item.ID] = i
+		marks = append(marks, "?")
+		args = append(args, item.ID)
+	}
+	rows, err := s.db.Query(`SELECT generation_id, position, mime FROM generation_images
+		WHERE generation_id IN (`+strings.Join(marks, ",")+`) ORDER BY generation_id, position`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var image GenerationImage
+		if err := rows.Scan(&id, &image.Position, &image.Mime); err != nil {
+			return err
+		}
+		if at, ok := index[id]; ok {
+			list[at].Images = append(list[at].Images, image)
+		}
+	}
+	return rows.Err()
+}
+
+// generationLocked 调用方自己持锁。
+func (s *Store) generationLocked(id string) (Generation, error) {
+	out, err := scanGeneration(s.db.QueryRow(`SELECT `+generationColumns+` `+generationFrom+` WHERE g.id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Generation{}, fail(404, "找不到这条作品")
+	}
+	if err != nil {
+		return Generation{}, err
+	}
+	list := []Generation{out}
+	if err := s.attachImages(list); err != nil {
+		return Generation{}, err
+	}
+	return list[0], nil
+}
+
+func (s *Store) generationByID(id string) (Generation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.generationLocked(id)
+}
+
+func (s *Store) saveGeneration(in GenerationInput) (Generation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := newID()
+	if _, err := s.db.Exec(`INSERT INTO generations
+		(id, user_id, prompt, protocol, model, size_label, channel, task_id, is_public, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+		id, in.UserID, in.Prompt, in.Protocol, in.Model, in.SizeLabel, in.Channel, in.TaskID, s.now()); err != nil {
+		return Generation{}, err
+	}
+	for position, image := range in.Images {
+		if _, err := s.db.Exec(`INSERT INTO generation_images
+			(id, generation_id, position, mime, source_url, bytes) VALUES (?, ?, ?, ?, ?, ?)`,
+			newID(), id, position, image.Mime, image.URL, image.Data); err != nil {
+			return Generation{}, err
+		}
+	}
+	return s.generationLocked(id)
+}
+
+// generations 收一个 WHERE 片段，用户作品集和公开作品共用同一套分页。
+func (s *Store) generations(where string, args []any, limit, offset int) ([]Generation, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) `+generationFrom+` `+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	pageArgs := append(append([]any{}, args...), limit, offset)
+	rows, err := s.db.Query(`SELECT `+generationColumns+` `+generationFrom+` `+where+
+		` ORDER BY g.created_at DESC, g.id DESC LIMIT ? OFFSET ?`, pageArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	list := []Generation{}
+	for rows.Next() {
+		item, err := scanGeneration(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		list = append(list, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	if err := s.attachImages(list); err != nil {
+		return nil, 0, err
+	}
+	return list, total, nil
+}
+
+func (s *Store) setUserDisplayName(userID, displayName string) (User, error) {
+	name := strings.TrimSpace(displayName)
+	if !validDisplayName(name) {
+		return User{}, fail(400, "中文名最多 24 个字")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec(`UPDATE users SET display_name = ? WHERE id = ?`, name, userID); err != nil {
+		return User{}, err
+	}
+	return s.userByID(userID)
+}
+
+func (s *Store) generationsByUser(userID string, limit, offset int) ([]Generation, int, error) {
+	return s.generations(`WHERE g.user_id = ?`, []any{userID}, limit, offset)
+}
+
+func (s *Store) publicGenerations(limit, offset int) ([]Generation, int, error) {
+	return s.generations(`WHERE g.is_public = 1`, nil, limit, offset)
+}
+
+func (s *Store) deleteGeneration(id, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`DELETE FROM generations WHERE id = ? AND user_id = ?`, id, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fail(404, "找不到这条作品")
+	}
+	if _, err := s.db.Exec(`DELETE FROM generation_images WHERE generation_id = ?`, id); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) setGenerationPublic(id, userID string, isPublic bool) (Generation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`UPDATE generations SET is_public = ? WHERE id = ? AND user_id = ?`,
+		boolToInt(isPublic), id, userID)
+	if err != nil {
+		return Generation{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return Generation{}, fail(404, "找不到这条作品")
+	}
+	return s.generationLocked(id)
+}
+
+func (s *Store) generationImage(id string, position int) (mime string, data []byte, sourceURL string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err = s.db.QueryRow(`SELECT mime, bytes, source_url FROM generation_images
+		WHERE generation_id = ? AND position = ?`, id, position).Scan(&mime, &data, &sourceURL)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, "", fail(404, "找不到这张图")
+	}
+	return mime, data, sourceURL, err
+}
+
+// fillGenerationImages 后台把只留了链接的图拉回来存好。
+// 拉不动就留着链接，前端会退回直接用它。
+func (s *Store) fillGenerationImages(generationID string) {
+	type pending struct {
+		id  string
+		url string
+	}
+	s.mu.Lock()
+	rows, err := s.db.Query(`SELECT id, source_url FROM generation_images
+		WHERE generation_id = ? AND bytes IS NULL AND source_url <> ''`, generationID)
+	if err != nil {
+		s.mu.Unlock()
+		return
+	}
+	list := []pending{}
+	for rows.Next() {
+		var item pending
+		if err := rows.Scan(&item.id, &item.url); err == nil {
+			list = append(list, item)
+		}
+	}
+	rows.Close()
+	s.mu.Unlock()
+
+	if len(list) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), imageFetchTimeout)
+	defer cancel()
+	for _, item := range list {
+		data, mime := fetchGeneratedImage(ctx, item.url)
+		if len(data) == 0 {
+			continue
+		}
+		s.mu.Lock()
+		if mime != "" {
+			s.db.Exec(`UPDATE generation_images SET bytes = ?, mime = ? WHERE id = ?`, data, mime, item.id)
+		} else {
+			s.db.Exec(`UPDATE generation_images SET bytes = ? WHERE id = ?`, data, item.id)
+		}
+		s.mu.Unlock()
 	}
 }

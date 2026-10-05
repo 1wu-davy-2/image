@@ -27,6 +27,7 @@ const (
 	upstreamTimeout    = 120 * time.Second
 	pollDeadline       = 180 * time.Second
 	imageLimit         = 20 * 1024 * 1024
+	imageFetchTimeout  = 60 * time.Second
 	batchOutputLimit   = 200
 	batchItemOutputMax = 4
 	batchProtocol      = "gemini-batch"
@@ -1006,6 +1007,30 @@ func downloadReference(ctx context.Context, raw string) (*imageFile, error) {
 		return &imageFile{Mime: mime, Buffer: res.Body, Name: "reference"}, nil
 	}
 	return nil, fail(400, "参考图重定向过多")
+}
+
+// fetchGeneratedImage 把上游给的成品图拉回来存进库，省得链接过期后作品集只剩空框。
+// 拉不动（含地址不是公网、超限、上游 4xx）就返回空，调用方退回直接用原链接。
+func fetchGeneratedImage(ctx context.Context, rawURL string) ([]byte, string) {
+	target, err := assertPublicImageURL(rawURL)
+	if err != nil {
+		return nil, ""
+	}
+	res, err := callUpstream(ctx, http.MethodGet, target, map[string]string{"User-Agent": defaultUserAgent}, nil)
+	if err != nil || res.Status < 200 || res.Status >= 300 {
+		return nil, ""
+	}
+	if len(res.Body) == 0 || len(res.Body) > imageLimit {
+		return nil, ""
+	}
+	mime := strings.ToLower(strings.TrimSpace(strings.Split(res.Header.Get("Content-Type"), ";")[0]))
+	if !allowedImageMimes[mime] {
+		mime = strings.ToLower(strings.TrimSpace(strings.Split(http.DetectContentType(res.Body), ";")[0]))
+	}
+	if !allowedImageMimes[mime] {
+		mime = "image/png"
+	}
+	return res.Body, mime
 }
 
 /* ---------- 批量生图 ---------- */
