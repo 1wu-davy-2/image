@@ -1,6 +1,9 @@
 data/
-grok-ui/
 node_modules/
+
+# 参考项目（grok 生成的），不属于本仓库
+grok-ui/
+grok-ui-new/
 
 # Go 构建产物（go build -o darkroom.exe 覆盖旧文件时会留下 ~ 备份）
 server-go/darkroom
