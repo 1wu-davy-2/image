@@ -6,11 +6,15 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	// 签到额度要在区间里随机，用 math/rand/v2；crypto/rand 留给 newID 和加盐。
+	mrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +27,6 @@ const (
 	defaultAdminUser     = "admin"
 	defaultAdminPassword = "admin@123"
 	sessionTTL           = 14 * 24 * time.Hour
-	defaultCheckinQuota  = 5
 	defaultGenerateCost  = 1
 )
 
@@ -46,26 +49,55 @@ type User struct {
 	CreatedAt       string `json:"createdAt"`
 }
 
-type Key struct {
-	ID               string   `json:"id"`
-	Name             string   `json:"name"`
-	Protocol         string   `json:"protocol"`
-	BaseURL          string   `json:"baseUrl"`
-	APIKey           string   `json:"apiKey"`
-	UserAgent        string   `json:"userAgent"`
-	Balance          *float64 `json:"balance"`
-	BalanceUnit      string   `json:"balanceUnit"`
-	BalanceValid     *bool    `json:"balanceValid"`
-	BalanceUpdatedAt string   `json:"balanceUpdatedAt"`
-	BalanceError     string   `json:"balanceError"`
-	Enabled          bool     `json:"enabled"`
-	Note             string   `json:"note"`
-	LastUsedAt       int64    `json:"lastUsedAt"`
+// ModelInfo 是中转站 /v1/models 里的一条。名字常常和 id 一样，但有的会更好看
+// （gpt-image-2.5-flare 的 display_name 是 "GPT Image 2.5 Flare"），所以两个都留。
+type ModelInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
+type Key struct {
+	ID               string      `json:"id"`
+	Name             string      `json:"name"`
+	Protocol         string      `json:"protocol"`
+	BaseURL          string      `json:"baseUrl"`
+	APIKey           string      `json:"apiKey"`
+	UserAgent        string      `json:"userAgent"`
+	Balance          *float64    `json:"balance"`
+	BalanceUnit      string      `json:"balanceUnit"`
+	BalanceValid     *bool       `json:"balanceValid"`
+	BalanceUpdatedAt string      `json:"balanceUpdatedAt"`
+	BalanceError     string      `json:"balanceError"`
+	Models           []ModelInfo `json:"models"`
+	ModelsUpdatedAt  string      `json:"modelsUpdatedAt"`
+	ModelsError      string      `json:"modelsError"`
+	Enabled          bool        `json:"enabled"`
+	Note             string      `json:"note"`
+	LastUsedAt       int64       `json:"lastUsedAt"`
+}
+
+// AvailableModel 是汇总给用户端的一条：这个模型有几把 Key 能用。
+type AvailableModel struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Keys      int    `json:"keys"`
+	Available bool   `json:"available"`
+}
+
+// Settings 里签到额度是个闭区间：每次签到在 [CheckinMin, CheckinMax] 里随机。
+// 两者相等就是固定额度。
 type Settings struct {
-	CheckinQuota int `json:"checkinQuota"`
+	CheckinMin   int `json:"checkinMin"`
+	CheckinMax   int `json:"checkinMax"`
 	GenerateCost int `json:"generateCost"`
+}
+
+// Checkin 是一条签到记录。
+type Checkin struct {
+	ID        string `json:"id"`
+	Day       string `json:"day"`
+	Amount    int    `json:"amount"`
+	CreatedAt string `json:"createdAt"`
 }
 
 type AdminState struct {
@@ -102,8 +134,9 @@ func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS settings (
   id             INTEGER PRIMARY KEY CHECK (id = 1),
-  checkin_quota  INTEGER NOT NULL,
-  generate_cost  INTEGER NOT NULL
+  checkin_min    INTEGER NOT NULL DEFAULT 5,
+  checkin_max    INTEGER NOT NULL DEFAULT 5,
+  generate_cost  INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS admin (
   id       INTEGER PRIMARY KEY CHECK (id = 1),
@@ -146,6 +179,9 @@ CREATE TABLE IF NOT EXISTS keys (
   balance_valid      INTEGER,
   balance_updated_at TEXT NOT NULL DEFAULT '',
   balance_error      TEXT NOT NULL DEFAULT '',
+  models             TEXT NOT NULL DEFAULT '',
+  models_updated_at  TEXT NOT NULL DEFAULT '',
+  models_error       TEXT NOT NULL DEFAULT '',
   enabled            INTEGER NOT NULL DEFAULT 1,
   note               TEXT NOT NULL DEFAULT '',
   last_used_at       INTEGER NOT NULL DEFAULT 0,
@@ -174,7 +210,15 @@ CREATE TABLE IF NOT EXISTS generation_images (
   bytes         BLOB
 );
 CREATE INDEX IF NOT EXISTS generation_images_gen ON generation_images(generation_id, position);
-INSERT OR IGNORE INTO settings (id, checkin_quota, generate_cost) VALUES (1, 5, 1);
+CREATE TABLE IF NOT EXISTS checkins (
+  id         TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL,
+  day        TEXT NOT NULL,
+  amount     INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS checkins_user ON checkins(user_id, created_at DESC);
+INSERT OR IGNORE INTO settings (id) VALUES (1);
 `)
 	if err != nil {
 		return err
@@ -189,17 +233,54 @@ INSERT OR IGNORE INTO settings (id, checkin_quota, generate_cost) VALUES (1, 5, 
 	}); err != nil {
 		return err
 	}
+	if err := s.addMissingColumns("keys", [][2]string{
+		{"models", "TEXT NOT NULL DEFAULT ''"},
+		{"models_updated_at", "TEXT NOT NULL DEFAULT ''"},
+		{"models_error", "TEXT NOT NULL DEFAULT ''"},
+	}); err != nil {
+		return err
+	}
 	// 邮箱要能当登录名，所以唯一。老库补列留下的空串不参与唯一，故用条件索引。
-	_, err = s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email_lower) WHERE email_lower <> ''`)
-	return err
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email_lower) WHERE email_lower <> ''`); err != nil {
+		return err
+	}
+	return s.migrateCheckinRange()
 }
 
-// addMissingColumns 给已存在的表补上后加的列。
-func (s *Store) addMissingColumns(table string, columns [][2]string) error {
-	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+// migrateCheckinRange 把老的固定签到额度搬成区间。
+//
+// settings 表早先只有 checkin_quota 一列，是个固定值；现在改成 checkin_min /
+// checkin_max，签到时在区间里随机。搬完就把旧列删掉，让新旧库的结构一致。
+func (s *Store) migrateCheckinRange() error {
+	if err := s.addMissingColumns("settings", [][2]string{
+		{"checkin_min", "INTEGER NOT NULL DEFAULT 5"},
+		{"checkin_max", "INTEGER NOT NULL DEFAULT 5"},
+	}); err != nil {
+		return err
+	}
+	columns, err := s.tableColumns("settings")
 	if err != nil {
 		return err
 	}
+	if !columns["checkin_quota"] {
+		return nil
+	}
+	// 老的固定值就是 min = max 的退化区间。
+	if _, err := s.db.Exec(
+		`UPDATE settings SET checkin_min = checkin_quota, checkin_max = checkin_quota`); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE settings DROP COLUMN checkin_quota`)
+	return err
+}
+
+// tableColumns 列出表上现有的列名。
+func (s *Store) tableColumns(table string) (map[string]bool, error) {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 	existing := map[string]bool{}
 	for rows.Next() {
 		var (
@@ -208,13 +289,17 @@ func (s *Store) addMissingColumns(table string, columns [][2]string) error {
 			dflt             any
 		)
 		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
-			rows.Close()
-			return err
+			return nil, err
 		}
 		existing[name] = true
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	return existing, rows.Err()
+}
+
+// addMissingColumns 给已存在的表补上后加的列。
+func (s *Store) addMissingColumns(table string, columns [][2]string) error {
+	existing, err := s.tableColumns(table)
+	if err != nil {
 		return err
 	}
 	for _, column := range columns {
@@ -340,24 +425,28 @@ func (s *Store) ensureAdminRow() error {
 
 func (s *Store) settings() (Settings, error) {
 	var out Settings
-	err := s.db.QueryRow(`SELECT checkin_quota, generate_cost FROM settings WHERE id = 1`).
-		Scan(&out.CheckinQuota, &out.GenerateCost)
+	err := s.db.QueryRow(`SELECT checkin_min, checkin_max, generate_cost FROM settings WHERE id = 1`).
+		Scan(&out.CheckinMin, &out.CheckinMax, &out.GenerateCost)
 	return out, err
 }
 
-func (s *Store) updateSettings(checkin, cost int) (Settings, error) {
-	if checkin < 0 || checkin > 1000 {
+func (s *Store) updateSettings(checkinMin, checkinMax, cost int) (Settings, error) {
+	if checkinMin < 0 || checkinMin > 1000 || checkinMax < 0 || checkinMax > 1000 {
 		return Settings{}, fail(400, "签到额度需要是 0 到 1000 的整数")
+	}
+	if checkinMin > checkinMax {
+		return Settings{}, fail(400, "签到额度的最小值不能大于最大值")
 	}
 	if cost < 0 || cost > 1000 {
 		return Settings{}, fail(400, "每次消耗需要是 0 到 1000 的整数")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(`UPDATE settings SET checkin_quota = ?, generate_cost = ? WHERE id = 1`, checkin, cost); err != nil {
+	if _, err := s.db.Exec(`UPDATE settings SET checkin_min = ?, checkin_max = ?, generate_cost = ? WHERE id = 1`,
+		checkinMin, checkinMax, cost); err != nil {
 		return Settings{}, err
 	}
-	return Settings{CheckinQuota: checkin, GenerateCost: cost}, nil
+	return Settings{CheckinMin: checkinMin, CheckinMax: checkinMax, GenerateCost: cost}, nil
 }
 
 /* ---------- 用户 ---------- */
@@ -711,12 +800,44 @@ func (s *Store) checkin(userID string) (int, User, error) {
 	if err != nil {
 		return 0, User{}, err
 	}
+	// 区间里随机；min = max 时就是这个固定值。
+	amount := settings.CheckinMin
+	if settings.CheckinMax > settings.CheckinMin {
+		amount += mrand.IntN(settings.CheckinMax - settings.CheckinMin + 1)
+	}
 	if _, err := s.db.Exec(`UPDATE users SET quota = quota + ?, last_checkin_date = ? WHERE id = ?`,
-		settings.CheckinQuota, today, userID); err != nil {
+		amount, today, userID); err != nil {
+		return 0, User{}, err
+	}
+	if _, err := s.db.Exec(`INSERT INTO checkins (id, user_id, day, amount, created_at) VALUES (?, ?, ?, ?, ?)`,
+		newID(), userID, today, amount, s.now()); err != nil {
 		return 0, User{}, err
 	}
 	updated, err := s.userByID(userID)
-	return settings.CheckinQuota, updated, err
+	return amount, updated, err
+}
+
+// checkinsByUser 倒序列出某个用户的签到记录，带总数好分页。
+func (s *Store) checkinsByUser(userID string, limit, offset int) ([]Checkin, int, error) {
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM checkins WHERE user_id = ?`, userID).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.Query(`SELECT id, day, amount, created_at FROM checkins
+		WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`, userID, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []Checkin{}
+	for rows.Next() {
+		var item Checkin
+		if err := rows.Scan(&item.ID, &item.Day, &item.Amount, &item.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, item)
+	}
+	return out, total, rows.Err()
 }
 
 func (s *Store) changeUserPassword(userID, oldPassword, newPassword string) error {
@@ -806,22 +927,29 @@ func (s *Store) deleteUser(id string) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fail(404, "找不到这个用户")
 	}
-	_, err = s.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, id)
+	if _, err := s.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, id); err != nil {
+		return err
+	}
+	// 签到记录跟着走，不然会留下指不到人的孤儿行。
+	_, err = s.db.Exec(`DELETE FROM checkins WHERE user_id = ?`, id)
 	return err
 }
 
 /* ---------- Key ---------- */
 
 const keyColumns = `id, name, protocol, base_url, api_key, user_agent, balance, balance_unit,
-	balance_valid, balance_updated_at, balance_error, enabled, note, last_used_at`
+	balance_valid, balance_updated_at, balance_error, models, models_updated_at, models_error,
+	enabled, note, last_used_at`
 
 func scanKey(row interface{ Scan(...any) error }) (Key, error) {
 	var key Key
 	var balance sql.NullFloat64
 	var valid sql.NullBool
 	var enabled int
+	var models string
 	err := row.Scan(&key.ID, &key.Name, &key.Protocol, &key.BaseURL, &key.APIKey, &key.UserAgent,
-		&balance, &key.BalanceUnit, &valid, &key.BalanceUpdatedAt, &key.BalanceError, &enabled, &key.Note, &key.LastUsedAt)
+		&balance, &key.BalanceUnit, &valid, &key.BalanceUpdatedAt, &key.BalanceError,
+		&models, &key.ModelsUpdatedAt, &key.ModelsError, &enabled, &key.Note, &key.LastUsedAt)
 	if err != nil {
 		return key, err
 	}
@@ -834,6 +962,13 @@ func scanKey(row interface{ Scan(...any) error }) (Key, error) {
 		key.BalanceValid = &value
 	}
 	key.Enabled = enabled != 0
+	// 存坏了就当没拉过，别让一行坏数据把整个 Key 列表带崩。
+	key.Models = []ModelInfo{}
+	if models != "" {
+		if err := json.Unmarshal([]byte(models), &key.Models); err != nil {
+			key.Models = []ModelInfo{}
+		}
+	}
 	return key, nil
 }
 
@@ -957,6 +1092,95 @@ func (s *Store) setKeyBalance(id string, balance *float64, unit string, valid *b
 		}
 	}
 	return s.keyByID(id)
+}
+
+// setKeyModels 记下这把 Key 能用的模型。errMessage 非空表示这次拉取失败了。
+func (s *Store) setKeyModels(id string, models []ModelInfo, errMessage string) (Key, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if errMessage != "" {
+		trimmed := errMessage
+		if len([]rune(trimmed)) > 300 {
+			trimmed = string([]rune(trimmed)[:300])
+		}
+		if _, err := s.db.Exec(`UPDATE keys SET models_error = ? WHERE id = ?`, trimmed, id); err != nil {
+			return Key{}, err
+		}
+		return s.keyByID(id)
+	}
+	encoded, err := json.Marshal(models)
+	if err != nil {
+		return Key{}, err
+	}
+	if _, err := s.db.Exec(`UPDATE keys SET models = ?, models_updated_at = ?, models_error = '' WHERE id = ?`,
+		string(encoded), s.now(), id); err != nil {
+		return Key{}, err
+	}
+	return s.keyByID(id)
+}
+
+// availableModels 把各把 Key 拉到的模型按调用方式汇总。
+//
+// 一条模型只要有一把「启用、有凭据、中转没说过失效、余额还大于 0」的 Key 挂着，
+// 就算可用；否则列出来但标成不可用——直接藏掉的话，用户只会看到空下拉框，
+// 不知道是没拉过模型还是 Key 出了问题。
+func (s *Store) availableModels() (map[string][]AvailableModel, error) {
+	all, err := s.keys()
+	if err != nil {
+		return nil, err
+	}
+	type slot struct {
+		name      string
+		keys      int
+		available bool
+	}
+	byProtocol := map[string]map[string]*slot{}
+	for _, key := range all {
+		if !key.Enabled || key.APIKey == "" || len(key.Models) == 0 {
+			continue
+		}
+		usable := key.BalanceValid == nil || *key.BalanceValid
+		if usable && key.Balance != nil && *key.Balance <= 0 {
+			usable = false
+		}
+		group := byProtocol[key.Protocol]
+		if group == nil {
+			group = map[string]*slot{}
+			byProtocol[key.Protocol] = group
+		}
+		for _, model := range key.Models {
+			item := group[model.ID]
+			if item == nil {
+				item = &slot{name: model.Name}
+				group[model.ID] = item
+			}
+			item.keys++
+			if usable {
+				item.available = true
+			}
+		}
+	}
+
+	out := map[string][]AvailableModel{}
+	for protocol, group := range byProtocol {
+		list := []AvailableModel{}
+		for id, item := range group {
+			name := item.name
+			if name == "" {
+				name = id
+			}
+			list = append(list, AvailableModel{ID: id, Name: name, Keys: item.keys, Available: item.available})
+		}
+		// 可用的排前面，同组按 id 排，顺序稳定。
+		sort.Slice(list, func(i, j int) bool {
+			if list[i].Available != list[j].Available {
+				return list[i].Available
+			}
+			return list[i].ID < list[j].ID
+		})
+		out[protocol] = list
+	}
+	return out, nil
 }
 
 // pickKey 挑一把能用的：启用、凭据齐全、中转没说过它失效。

@@ -227,6 +227,25 @@ func callJSON(ctx context.Context, method, target string, cred credential, paylo
 /* ---------- 错误信息 ---------- */
 
 func errorMessage(payload map[string]any, status int) string {
+	return upstreamHint(rawErrorMessage(payload, status))
+}
+
+// upstreamHint 给中转站的英文原文补一句中文，说清下一步该干什么。
+// 光把原文透出去，用户看到 "is not supported by any configured account" 也不知道是
+// 该换模型还是该换 Key。
+func upstreamHint(message string) string {
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "is not supported by any configured account"),
+		strings.Contains(lower, "无可用渠道"), strings.Contains(lower, "没有可用渠道"):
+		return message + "（这个模型不在你中转站账号的分组里：换一个模型，或到中转站后台确认这把 Key 所属的分组支持哪些模型。）"
+	case strings.Contains(lower, "insufficient") && strings.Contains(lower, "quota"):
+		return message + "（中转站账号余额不够了，去管理端刷新一下余额看看。）"
+	}
+	return message
+}
+
+func rawErrorMessage(payload map[string]any, status int) string {
 	if payload != nil {
 		switch nested := payload["error"].(type) {
 		case string:
@@ -534,6 +553,52 @@ func parseBalance(payload map[string]any) (balance, bool) {
 		}
 	}
 	return out, true
+}
+
+// fetchKeyModels 问中转站这把 Key 能用哪些模型。
+//
+// /v1/models 的正文各家写法不一，id 和 display_name 都可能缺，所以两个字段都认，
+// 缺 id 的条目直接丢掉——没有 id 就没法拿去生图。
+func fetchKeyModels(ctx context.Context, key Key) ([]ModelInfo, error) {
+	origin, err := relayOrigin(key.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	res, err := callUpstream(ctx, http.MethodGet, origin+"/v1/models",
+		authHeaders(credential{APIKey: key.APIKey, UserAgent: key.UserAgent}), nil)
+	if err != nil {
+		return nil, err
+	}
+	payload := res.payload()
+	if res.Status < 200 || res.Status >= 300 {
+		return nil, fail(res.Status, errorMessage(payload, res.Status))
+	}
+	raw := arr(payload, "data")
+	if raw == nil {
+		raw = arr(payload, "models")
+	}
+	out := []ModelInfo{}
+	seen := map[string]bool{}
+	for _, entry := range raw {
+		item, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		id := firstString(item["id"], item["name"], item["model"])
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		name := firstString(item["display_name"], item["displayName"])
+		if name == "" {
+			name = id
+		}
+		out = append(out, ModelInfo{ID: id, Name: name})
+	}
+	if len(out) == 0 {
+		return nil, fail(502, "模型接口没有返回任何模型")
+	}
+	return out, nil
 }
 
 func fetchKeyBalance(ctx context.Context, key Key) (balance, error) {

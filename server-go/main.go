@@ -110,6 +110,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/me", s.wrap(s.me))
 	mux.HandleFunc("PATCH /api/me", s.wrap(s.updateMe))
 	mux.HandleFunc("POST /api/checkin", s.wrap(s.checkin))
+	mux.HandleFunc("GET /api/checkins", s.wrap(s.checkinList))
+	mux.HandleFunc("GET /api/models", s.wrap(s.availableModels))
 	mux.HandleFunc("POST /api/me/password", s.wrap(s.changeMyPassword))
 	mux.HandleFunc("POST /api/generate", s.wrap(s.generateHandler))
 
@@ -140,6 +142,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/admin/keys", s.wrap(s.adminSaveKey))
 	mux.HandleFunc("DELETE /api/admin/keys/{id}", s.wrap(s.adminDeleteKey))
 	mux.HandleFunc("POST /api/admin/keys/{id}/balance", s.wrap(s.adminRefreshBalance))
+	mux.HandleFunc("POST /api/admin/keys/{id}/models", s.wrap(s.adminRefreshModels))
 	mux.HandleFunc("PATCH /api/admin/users/{id}", s.wrap(s.adminPatchUser))
 	mux.HandleFunc("DELETE /api/admin/users/{id}", s.wrap(s.adminDeleteUser))
 	mux.HandleFunc("POST /api/admin/users/{id}/password", s.wrap(s.adminResetUserPassword))
@@ -549,7 +552,8 @@ func (s *server) me(w http.ResponseWriter, r *http.Request) error {
 	writeJSON(w, 200, map[string]any{
 		"ok":           true,
 		"user":         user,
-		"checkinQuota": settings.CheckinQuota,
+		"checkinMin":   settings.CheckinMin,
+		"checkinMax":   settings.CheckinMax,
 		"generateCost": settings.GenerateCost,
 	})
 	return nil
@@ -565,6 +569,21 @@ func (s *server) checkin(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "amount": amount, "user": updated})
+	return nil
+}
+
+// checkinList 列自己的签到记录，倒序，分页。
+func (s *server) checkinList(w http.ResponseWriter, r *http.Request) error {
+	user, err := s.requireUser(r)
+	if err != nil {
+		return err
+	}
+	limit, offset := pageParams(r)
+	items, total, err := s.store.checkinsByUser(user.ID, limit, offset)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "items": items, "total": total})
 	return nil
 }
 
@@ -1266,15 +1285,19 @@ func (s *server) adminSettings(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	checkin, ok := firstNumber(body["checkinQuota"])
-	if !ok || checkin != float64(int(checkin)) {
+	checkinMin, ok := firstNumber(body["checkinMin"])
+	if !ok || checkinMin != float64(int(checkinMin)) {
+		return fail(400, "签到额度需要是 0 到 1000 的整数")
+	}
+	checkinMax, ok := firstNumber(body["checkinMax"])
+	if !ok || checkinMax != float64(int(checkinMax)) {
 		return fail(400, "签到额度需要是 0 到 1000 的整数")
 	}
 	cost, ok := firstNumber(body["generateCost"])
 	if !ok || cost != float64(int(cost)) {
 		return fail(400, "每次消耗需要是 0 到 1000 的整数")
 	}
-	settings, err := s.store.updateSettings(int(checkin), int(cost))
+	settings, err := s.store.updateSettings(int(checkinMin), int(checkinMax), int(cost))
 	if err != nil {
 		return err
 	}
@@ -1404,6 +1427,49 @@ func (s *server) adminRefreshBalance(w http.ResponseWriter, r *http.Request) err
 		return err
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "key": updated})
+	return nil
+}
+
+// adminRefreshModels 问中转站这把 Key 能用哪些模型，记下来给用户端的模型下拉用。
+func (s *server) adminRefreshModels(w http.ResponseWriter, r *http.Request) error {
+	if err := s.requireAdmin(r); err != nil {
+		return err
+	}
+	id := r.PathValue("id")
+	key, err := s.store.keyByID(id)
+	if err != nil {
+		return fail(404, "找不到这把 Key")
+	}
+	models, err := fetchKeyModels(r.Context(), key)
+	if err != nil {
+		message := "拉取模型失败"
+		var typed *httpError
+		if errors.As(err, &typed) {
+			message = typed.msg
+		}
+		if _, saveErr := s.store.setKeyModels(id, nil, message); saveErr != nil {
+			log.Printf("记录模型错误失败：%v", saveErr)
+		}
+		return err
+	}
+	updated, err := s.store.setKeyModels(id, models, "")
+	if err != nil {
+		return err
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "key": updated})
+	return nil
+}
+
+// availableModels 给用户端：按调用方式汇总所有 Key 能用的模型。
+func (s *server) availableModels(w http.ResponseWriter, r *http.Request) error {
+	if _, err := s.requireUser(r); err != nil {
+		return err
+	}
+	models, err := s.store.availableModels()
+	if err != nil {
+		return err
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "models": models})
 	return nil
 }
 
