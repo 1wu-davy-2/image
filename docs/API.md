@@ -52,6 +52,16 @@ Generation  id, username, displayName, prompt, protocol, model, sizeLabel, chann
 三个类型是固定的，管理端只能改每行的 `defaultModel` 和 `multiplier`，不能增删。
 `multiplier` 是扣额度的倍率（稳定版贵一点，比如 1.5）。
 
+### 倍率是两层相乘
+
+```
+费用 = 每次生图消耗 × 类型倍率 × 模型倍率     （向上取整，至少 1）
+```
+
+模型倍率按**模型名全局**存（`model_rates` 表），不挂在哪把 Key 上——
+同一个模型换把 Key 来发，价钱该是一样的。**没设过就是 1.0**，也就是这个模型不加价，
+类型那一层的倍率照旧生效。
+
 ## 用户端
 
 | 方法 | 路径 | 说明 |
@@ -70,6 +80,7 @@ Generation  id, username, displayName, prompt, protocol, model, sizeLabel, chann
 | `GET` | `/api/generations` | 自己的作品集。`limit`（默认 24，上限 100）、`offset` |
 | `GET` | `/api/generations/{id}` | 作品详情。自己的，或已公开的；其余一律 404 |
 | `PATCH` | `/api/generations/{id}` | 公开 / 取消公开。body `{isPublic}`，不是布尔值返回 400 |
+| | | **新图落库时默认就是公开的**（`is_public = 1`），想藏起来自己点「取消公开」 |
 | `DELETE` | `/api/generations/{id}` | 删除自己的作品 |
 | `GET` | `/api/generations/{id}/images/{position}` | 作品图片，原始字节。字节还没拉回来时 302 到上游链接 |
 | `GET` | `/api/works` | 公开作品。不登录也能看，登录了会标出 `mine` |
@@ -105,13 +116,22 @@ Generation  id, username, displayName, prompt, protocol, model, sizeLabel, chann
 
 老走法还留着：给 `protocol` + `model`，倍率按 1 算。两种都不给按 `protocol` 的默认值走。
 
-- 给 `type` 时：模型用这个类型的 `defaultModel`，调用方式用**挑中的那把 Key 的**
-  `protocol`，费用 = `generateCost × multiplier`（向上取整，至少 1）。
+- 给 `type` 时：调用方式用**挑中的那把 Key 的** `protocol`，
+  费用 = `generateCost × 类型倍率 × 模型倍率`（向上取整，至少 1），见上面「倍率是两层相乘」。
+- `model` 在给 `type` 时是**可选**的：不传就用这个类型的 `defaultModel`；
+  传了就用传的那个。挑 Key 时按**实际要用的那个模型**找，不是按默认模型找——
+  用户特意挑了个别的模型，挑到一把没这个模型的 Key 就白挑了。
 - 因为调用方式是挑完 Key 才知道的，前端**两套尺寸字段都要发**（`size` + `quality`、
   `aspectRatio` + `imageSize`），服务端按挑中的调用方式取用得上的那套。
 - `mode` 是 `generate` 或 `edit`。`edit` 必须再带参考图：`image: {mime, data, name}`（base64）
   或 `imageUrl`（https）。
 - 蒙版可选：`mask`（同上结构）或 `maskUrl`。只在 `edit` 下有效，`gemini-official` 不支持。
+- **参考图 / 蒙版的网址由服务端取回来**，不转给上游：先验状态码，再认字节的魔数
+  （不看响应头，对象存储常把真图标成 `application/octet-stream`），最后一律按
+  multipart 发出去。所以上游那边不存在「它自己取不到图」这种情况。
+  取不到 / 不是图片 / 超过 20MB 都当场 400，且报错会写明是参考图还是蒙版。
+- 带蒙版时**不会退到对话兜底**：对话接口只收文字和参考图，退过去等于悄悄出一张
+  没蒙版的图。这时宁可报错，让用户去掉蒙版或换一把 Key。
 - 调用方式是 `gpt` 时用 `size` + `quality`；是 `nano` / `gemini-official` 时改用
   `aspectRatio`（`1:1`/`3:2`/`2:3`/`4:3`/`3:4`/`16:9`/`9:16`）+ `imageSize`（`1K`/`2K`/`4K`）。
 - `size` 只收具体像素（`2048x1536`）。**发 `2K` 这种档位写法会被上游打回**
@@ -129,7 +149,7 @@ Generation  id, username, displayName, prompt, protocol, model, sizeLabel, chann
 `images` 的元素要么是 `{url}`，要么是 `{b64, mime}`。`channel` 是 `async`/`sync`/`chat`/`gemini`，
 前端只用来提示走了哪条链路。
 
-**额度**：进入时先按 `generateCost × multiplier`（向上取整）扣，生成失败要把扣掉的加回去，
+**额度**：进入时先按 `generateCost × 类型倍率 × 模型倍率`（向上取整）扣，生成失败要把扣掉的加回去，
 并在错误响应里带上 `quota` 字段。挑 Key 失败、规格不合法、上游报错都算失败。
 向上取整是因为额度是整数：1.5 倍的模型按 1 倍收，倍率就等于没有；向下取整又会少扣。
 
@@ -155,7 +175,11 @@ Generation  id, username, displayName, prompt, protocol, model, sizeLabel, chann
   `output_count` 是 1-4。单个任务最多 200 个条目、200 个输出（所有 `output_count` 之和）。
 - 提交按 `generateCost × 输出总数` 扣额度，**提交失败要全额退回**；上游受理之后不再退。
 - 除提交外的所有操作都不扣额度，但同样需要挑一把 `gemini-batch` 的 Key。
+  没挂这种 Key 时 `/api/batches/models` 会直接报错，前端把错误写进下拉里并禁用。
 - 非原始字节的接口统一返回 `{ok: true, result: <上游原样返回的 JSON>}`。
+- `/api/batches/models` 的**返回形状上游没保证过**，前端把 `data` / `models` / `items`
+  几种外壳和裸数组都认一遍，条目取 `id` / `model` / `name`，认不出来就当没有可用模型。
+  批量生图的模型是**严格下拉**：只能选中转站认的模型，不再让用户手打模型名。
 
 ## 管理端
 
@@ -171,6 +195,24 @@ Generation  id, username, displayName, prompt, protocol, model, sizeLabel, chann
 | `POST` | `/api/admin/keys/{id}/balance` | 查余额，见下 |
 | `POST` | `/api/admin/keys/{id}/models` | 拉这把 Key 能用的模型，见下 |
 | `PUT` | `/api/admin/types/{type}` | body `{defaultModel, multiplier}`。倍率限 0.1–100 |
+| `PUT` | `/api/admin/models/{id}` | body `{multiplier}`，模型倍率，限 0.1–100。返回全部倍率 |
+| `GET` | `/api/admin/audit` | 审计日志。`action` 筛选、`limit`/`offset` 分页，返回 `{items, total, actions}` |
+
+### 审计日志
+
+`audit_logs` 表：`actor_kind`(user/admin)、`actor_id`、`actor_name`、`action`、`target`、
+`detail`、`ip`、`created_at`。**只增不改不删**。
+
+- 记什么：注册、登录、登录失败、登出、签到、改名、改密码、生图、生图失败、批量生图、
+  公开/取消公开、删除作品；管理端的登录、登录失败、登出、改签到规则、改管理密码、
+  增删改 Key、改生图类型、改模型倍率、改用户（额度/停用）、重置用户密码、删除用户。
+- 不记什么：查余额、拉模型列表这类纯读操作。它们由后台每 5 分钟自动跑一遍，
+  记下来只会把日志淹掉。
+- **Key 的密钥不进审计**：审计是给人翻的，不该变成第二个泄露面。
+- 审计写失败只在服务端日志里留痕，**绝不把已经成功的操作搅黄**——它是旁路。
+- 翻页按 `rowid` 倒序，不按 `created_at`：时间戳只到秒，同一秒里连着发生的几件事
+  按时间排会乱套，而审计要看的恰恰是先后。
+- `actions` 是记录里出现过的动作，给筛选下拉用；写死的列表会跟写入点对不上。
 | `PATCH` | `/api/admin/users/{id}` | body 可含 `quota` 和/或 `disabled` |
 | `POST` | `/api/admin/users/{id}/password` | 重置该用户密码，同时踢掉他的所有会话 |
 | `DELETE` | `/api/admin/users/{id}` | 删除用户 |
@@ -203,13 +245,19 @@ Generation  id, username, displayName, prompt, protocol, model, sizeLabel, chann
 ```json
 { "ok": true, "types": [
   { "type": "gpt", "label": "GPT", "defaultModel": "gpt-image-2.5", "multiplier": 1.5,
-    "keys": 2, "usable": true, "modelKnown": true } ] }
+    "keys": 2, "usable": true, "modelKnown": true,
+    "models": [ { "id": "gpt-image-2.5", "name": "gpt-image-2.5" } ] } ] }
 ```
 
 - 固定三个类型，但**一把 Key 都没挂的类型不列出来**——用户端只看到空下拉框没意义。
 - `usable`：这个类型下面至少有一把能用的 Key。
 - `modelKnown`：这些 Key 里至少有一把拉过模型列表、且列表里有 `defaultModel`。
   管理端把默认模型配错了，用户端当场就能提示，不用等生图报错。
+- `models`：这个类型下面各把 Key 拉到的模型**并集**，按 id 排，给用户端手动选模型用。
+  每项带 `multiplier`（这个模型的倍率，没设过是 1）和 `cost`（**已经算好**的
+  「每次生图消耗 × 类型倍率 × 模型倍率」向上取整）。用户端直接显示 `cost` 就行，
+  不用自己再算一遍。默认模型不在并集里时用户端也要把它补进下拉框——
+  不然默认值选不中，用户看到的会是另一个模型。
 
 ### 调用上游
 
@@ -253,6 +301,20 @@ Generation  id, username, displayName, prompt, protocol, model, sizeLabel, chann
   分不清是没拉过模型还是 Key 出了问题。
 - 可用的排前面，同组按 id 排，顺序稳定。
 - 没拉过任何模型的调用方式不会出现在结果里。
+
+### 定时刷新
+
+后端起一个后台循环，**每 5 分钟**把所有启用中的 Key 的余额和模型各拉一遍，
+起来的时候先拉一次。管理端那两个手动按钮还在，这个是兜底：余额和模型都不刷新的话，
+挑 Key 一直按旧数据挑——钱花完了还在挑它，模型下架了还在发它，
+用户收到的都是看不懂的上游报错。
+
+- 停用的 Key 和没有 `apiKey` 的跳过，不花这个请求。
+- 逐个串行拉，不并发：一次开十几路请求打中转站容易被当成异常流量，
+  日志也会搅成一团分不清哪把 Key 出的问题。
+- 两个各自成败，互不牵连——余额查得到、模型拉不到是常事。
+- 失败只记 `balanceError` / `modelsError`，**不清掉上次拉到的值**。
+- 中途 `ctx` 被取消（进程在关）就立刻停，不再往下拉。
 
 ### 查余额
 
