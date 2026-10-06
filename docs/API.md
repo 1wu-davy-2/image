@@ -20,6 +20,10 @@
 
 ## 数据模型
 
+存储层支持 SQLite 和 MariaDB 两种（见 README 的「数据库」一节）。下面这些表名在
+MariaDB 上**表名是 `api_keys`**——`keys` 是 MariaDB 保留字，不加反引号查不了，
+所以干脆改了名，SQLite 那边跟着一起改，两边表名一致。
+
 ```
 User      id, username, displayName, phone, email, quota, disabled, isAdmin,
           lastCheckinDate(YYYY-MM-DD, 北京时区), createdAt
@@ -129,7 +133,7 @@ Generation  id, username, displayName, prompt, protocol, model, sizeLabel, chann
 - **参考图 / 蒙版的网址由服务端取回来**，不转给上游：先验状态码，再认字节的魔数
   （不看响应头，对象存储常把真图标成 `application/octet-stream`），最后一律按
   multipart 发出去。所以上游那边不存在「它自己取不到图」这种情况。
-  取不到 / 不是图片 / 超过 20MB 都当场 400，且报错会写明是参考图还是蒙版。
+  取不到 / 不是图片 / 超过 64MB 都当场 400，且报错会写明是参考图还是蒙版。
 - 带蒙版时**不会退到对话兜底**：对话接口只收文字和参考图，退过去等于悄悄出一张
   没蒙版的图。这时宁可报错，让用户去掉蒙版或换一把 Key。
 - 调用方式是 `gpt` 时用 `size` + `quality`；是 `nano` / `gemini-official` 时改用
@@ -275,7 +279,7 @@ Generation  id, username, displayName, prompt, protocol, model, sizeLabel, chann
   从 `candidates[].content.parts[].inlineData.data` 读 base64。
 - **gemini-batch**：`{origin}/v1/images/batches` 一族，见上面表格。
 
-参考图和蒙版只收 PNG/JPEG/WebP，各自上限 20MB。用 URL 时要挡内网和本机地址，
+参考图和蒙版只收 PNG/JPEG/WebP，各自上限 64MB。用 URL 时要挡内网和本机地址，
 跟随重定向最多 3 跳。参考图和蒙版一个是文件一个是 URL 时，把 URL 那一半下下来，
 统一按 multipart 发（上游只有「两个文件」和「两个 URL」两种形状）。
 

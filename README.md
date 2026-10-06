@@ -25,7 +25,7 @@
 
 其余功能：
 
-- 文生图 / 图生图，参考图可以上传（PNG、JPEG、WebP，小于 20MB），也可以填一个 https 图片地址。
+- 文生图 / 图生图，参考图可以上传（PNG、JPEG、WebP，小于 64MB），也可以填一个 https 图片地址。
 - 图生图可以带**蒙版**，指定只重绘哪一块（Gemini 官方直连不支持蒙版）。
 - 账号体系：注册登录、每天签到领额度、每次生图扣额度，生图失败自动把额度退回去；
   用户可以改自己的密码。
@@ -50,6 +50,18 @@ PORT=18888 \
 CORS_ORIGINS=http://127.0.0.1:16666,http://localhost:16666 \
 go run .                           # 后端，127.0.0.1:18888
 ```
+
+**数据库**：不设 `DB_HOST` 就用本地 SQLite 文件（`DATA_FILE`，默认 `../data/darkroom.db`）；
+设了就走 MariaDB：
+
+```bash
+DB_HOST=101.43.75.72 DB_PORT=3306 DB_NAME=image \
+DB_USER=image DB_PASSWORD='...' \
+PORT=18888 CORS_ORIGINS=... go run .
+```
+
+`CORS_ORIGINS` 那一行不能省：前端在 16666、后端在 18888，属于跨源，不放行的话
+浏览器会直接报 **Failed to fetch**，看起来像后端挂了，其实是被 CORS 挡了。
 
 然后打开 **http://127.0.0.1:16666** 。
 
@@ -124,12 +136,12 @@ ADMIN_USER=admin ADMIN_PASSWORD=your-password go run .
 ## 后端
 
 `web/` 是纯静态前端，只认 `/api` 和 `/health`，不知道后端是什么写的。后端只有一套：
-`server-go/`，Go + SQLite。
+`server-go/`，Go + SQLite / MariaDB（两种都支持，见下面「数据库」一节）。
 
 |  |  |
 | --- | --- |
-| 依赖 | `modernc.org/sqlite`（纯 Go，不需要 CGO 和 gcc）、`golang.org/x/crypto` |
-| 存储 | `data/darkroom.db`（SQLite） |
+| 依赖 | `modernc.org/sqlite`（纯 Go，不需要 CGO 和 gcc）、`github.com/go-sql-driver/mysql`、`golang.org/x/crypto` |
+| 存储 | 默认 `data/darkroom.db`（SQLite）；设了 `DB_HOST` 就用 MariaDB |
 | 默认端口 | 6670 |
 | 启动 | `cd server-go && go run .`，或 `go build -o darkroom.exe . && ./darkroom.exe` |
 
@@ -154,12 +166,60 @@ ADMIN_USER=admin ADMIN_PASSWORD=your-password go run .
 | --- | --- | --- |
 | `PORT` | `6670` | 监听端口 |
 | `CORS_ORIGINS` | `http://127.0.0.1:6664,http://localhost:6664` | 放行哪些来源跨源访问 |
-| `DATA_FILE` | `../data/darkroom.db` | SQLite 文件路径 |
+| `DATA_FILE` | `../data/darkroom.db` | SQLite 文件路径（不设 `DB_HOST` 时才用） |
+| `DB_HOST` | 无 | 设了就用 MariaDB，不设就退回 SQLite |
+| `DB_PORT` | `3306` | MariaDB 端口 |
+| `DB_NAME` | `image` | 库名 |
+| `DB_USER` | `image` | 库账号 |
+| `DB_PASSWORD` | 无 | 库密码。设了 `DB_HOST` 就必须给，否则拒绝启动 |
+| `DB_TLS` | `skip-verify` | 连 MariaDB 的加密方式。默认强制加密但不校验证书（服务端多是自签证书）；`preferred` 是有就用、没有退回明文 |
+| `DB_TLS_CA` | 无 | 服务端证书的 CA（PEM 文件）。设了它就能真正校验证书，这时 `DB_TLS` 会失效 |
 | `WEB_DIR` | `../web` | 前端目录 |
 | `ADMIN_USER` | `admin` | 管理端账号 |
 | `ADMIN_PASSWORD` | 无 | 设了之后每次启动都会把管理端对齐到这个值，忘了密码时也能靠它找回 |
 | `RELAY_HOSTS` | uuapi 那四个域名 | 中转域名白名单，逗号分隔。只有自建中转或本地起桩测试才需要改；放开它等于允许把请求发到任意主机 |
 | `RELAY_CA_FILE` | 无 | 额外信任的 CA 证书（PEM），用来接自签证书的中转站 |
+
+## 数据库：SQLite 还是 MariaDB
+
+两种都支持，靠 `DB_HOST` 切。**测试全跑在 SQLite 上**——不设 `DB_HOST` 时
+`go test` 用的是临时文件，不用为了跑一遍测试去连远端。建表语句是一份、两边通用
+（`VARCHAR` 在 SQLite 里是 TEXT 亲和，`LONGBLOB` 是 BLOB 亲和），只有下面几处
+按方言分开，都在 `store.go` 里标了注释：
+
+| 差异 | SQLite | MariaDB |
+| --- | --- | --- |
+| 「已存在就跳过」 | `INSERT OR IGNORE` | `INSERT IGNORE` |
+| 「有则改无则插」 | `ON CONFLICT … excluded.x` | `ON DUPLICATE KEY UPDATE … VALUES(x)` |
+| 查表结构 | `PRAGMA table_info` | `information_schema.columns` |
+| 邮箱唯一索引 | 条件索引 `WHERE email_lower <> ''` | 普通唯一索引（MariaDB 不支持条件索引） |
+| 审计日志的插入顺序 | 隐式 `rowid` | 显式 `seq BIGINT AUTO_INCREMENT` |
+
+**几个踩过的坑，换库前先看**：
+
+- **`keys` 是 MariaDB 保留字**，不加反引号查不了。表已改名 `api_keys`（SQLite 那边
+  也跟着改了，老库启动时自动 rename），不然得在十几条语句里到处补引号，
+  而 Go 的原始字符串里还写不了反引号。
+- **`max_allowed_packet` 决定单张图能不能存进去**。默认 16MB，超了这条 UPDATE 会被
+  整个拒掉，而且**连接会跟着断**（实测），同一个连接上后面几条查询一起完蛋。
+  所以存图那一步主动卡在「服务端的包上限 - 1MB」，超了不写库、只留 `source_url`，
+  作品集退回用上游链接——图还看得见，只是链接会过期。
+  服务端的值在启动时读一次（日志里会打出来），**调大服务端之后重启一下服务**即可，
+  不用改代码。要执行的 SQL 见 `docs/mariadb-tuning.sql`。
+- **MariaDB 允许 `TEXT` 带 `DEFAULT`，MySQL 不允许**。这份 schema 有几十个
+  `TEXT NOT NULL DEFAULT ''`，迁到 MySQL 上会全挂。
+- **应用层那把互斥锁只在单进程内有效**。它是给 SQLite 准备的（一个连接 + 一把锁 =
+  天然全串行），换 MariaDB 后照样管用，但多开一个实例就各锁各的，扣额度那种
+  读-改-写会互相踩。要真正并发起来得把那二十来个方法改成事务 + 行锁。
+
+**搬数据**（一次性）：
+
+```bash
+cd server-go
+IMAGE_DB_PASSWORD='...' go test -run TestMigrateSQLiteToMariaDB -v .
+```
+
+目标库里只要有任何一张表非空就会拒绝执行，不会覆盖已有数据。
 
 ## 上手顺序
 
@@ -396,7 +456,7 @@ data/               运行时数据（已 gitignore）
 
 - 数据都写在 `data/darkroom.db` 里，API Key 是明文存的。别把这个目录提交上去，也别把服务开到公网。
 - 会话用 HttpOnly Cookie，有效期 14 天。管理端和用户端的会话是分开的。
-- 请求上游超时 120 秒，异步任务最多轮询 180 秒；请求体上限 32MB，参考图和蒙版上限 20MB。
+- 请求上游超时 120 秒，异步任务最多轮询 180 秒；请求体上限 96MB，参考图和蒙版上限 64MB。
 - 中转地址和参考图地址都只收 https，参考图地址还会挡掉本机、内网和 `.local` / `.internal`，
   跟随重定向最多 3 跳。
 - README 里的截图是对着一个假的中转站跑出来的：画面是画出来的占位图，批量任务也是桩数据。
