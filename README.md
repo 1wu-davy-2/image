@@ -73,11 +73,17 @@ ADMIN_USER=admin ADMIN_PASSWORD=your-password go run .
 
 | 页面 | 干什么 |
 | --- | --- |
-| 首页 · 签到 | 看额度、签到领额度、账号信息，外加最近几张作品 |
+| 首页 · 签到 | 看额度、签到领额度、翻签到记录，外加最近几张作品 |
 | 公开作品 | 所有人公开出来的图。不登录也能看 |
-| 创作 | 生图表单和批量生图。生成的图自动收进作品集 |
+| 创作 | 「画面」和「批量生图」两个标签页，默认画面。模型下拉列的是中转站实际支持的模型 |
+
+尺寸按「画幅 × 分辨率」选：画幅 `1:1` / `4:3` / `3:4` / `16:9`，分辨率 `1K` / `2K` / `4K`。
+长边定档（1K→1024、2K→2048、4K→4096），短边按比例算，所以 `2K · 4:3` 就是 `2048x1536`。
+界面上显示的是换算后的像素——中转站只认具体像素，发 `2K` 这种档位会被打回。
 | 作品集 | 自己生成过的图，可以设成公开或删掉 |
-| 系统设置 | 改中文名、改密码、退出 |
+| 系统设置 | 账号信息、改中文名、改密码、退出 |
+
+退出登录会退回介绍页，不是直接甩到登录表单——退出的人多半只是想离开工作台。
 
 作品集里的图由服务端存着（`generations` + `generation_images` 两张表，图片存 BLOB），
 上游链接过期也不影响。只有设成公开的才出现在「公开作品」里。
@@ -85,6 +91,10 @@ ADMIN_USER=admin ADMIN_PASSWORD=your-password go run .
 菜单栏底部和用户菜单里的「管理端」**只有管理员看得见**，普通用户那边根本不渲染。
 判断依据是用户表上的 `is_admin` 标志，不是「名字叫 admin」——管理员没登过用户端时，
 `admin` 这个名字是能被普通用户抢注的，靠名字判断会认错人。
+
+介绍页和登录页上**不露管理入口**，管理端只能自己敲 `/admin` 进。这只挡视线不挡人：
+所有 `/api/admin/*` 都要 `darkroom_admin` 这个 Cookie 的会话，没有一律 401，
+用户端的 `darkroom_user` 顶不上——两个会话是分开的。
 
 ## 后端
 
@@ -155,9 +165,10 @@ ADMIN_USER=admin ADMIN_PASSWORD=your-password go run .
 刷新和前进后退都能回到原来那一页：
 
 - **用户管理**：改额度、重置密码、停用 / 启用、删除。停用或重置密码会立刻踢掉该用户的所有会话。
-- **API 管理**：Key 的增删改查、启用停用、刷新余额、逐把 Key 配置请求头 `User-Agent`。
+- **API 管理**：Key 的增删改查、启用停用、刷新余额、**拉取模型**、逐把 Key 配置请求头 `User-Agent`。
   中转地址只接受 `uuapi.io`、`uuapi.net`、`uuapi.shop`、`uuapi.cc` 四个域名下的 https 地址。
-- **签到**：每天签到领多少额度、每次生图扣多少额度，以及改管理端自己的密码。
+- **签到**：每天签到领多少额度（填个区间，比如 2-5，签到时随机给）、每次生图扣多少额度，
+  以及改管理端自己的密码。
 
 ### 余额是怎么查的
 
@@ -184,11 +195,13 @@ ADMIN_USER=admin ADMIN_PASSWORD=your-password go run .
 | `POST` | `/api/auth/register` | 注册并登录 |
 | `POST` | `/api/auth/login` | 登录 |
 | `POST` | `/api/auth/logout` | 退出 |
-| `GET` | `/api/me` | 当前用户、签到额度、每次生图消耗 |
-| `POST` | `/api/checkin` | 签到领额度 |
+| `GET` | `/api/me` | 当前用户、签到额度区间、每次生图消耗 |
+| `POST` | `/api/checkin` | 签到领额度，返回这次随机到的 `amount` |
+| `GET` | `/api/checkins` | 自己的签到记录，倒序分页 |
+| `GET` | `/api/models` | 各调用方式下中转站实际支持的模型 |
 | `POST` | `/api/me/password` | 改自己的密码 |
 | `PATCH` | `/api/me` | 改中文名。body `{displayName}`，最多 24 字 |
-| `POST` | `/api/generate` | 生图（先扣额度，失败退回） |
+| `POST` | `/api/generate` | 生图（先扣额度，失败退回）。中转站的报错会补一句中文提示 |
 | `GET` | `/api/generations` | 自己的作品集。`limit`（默认 24，上限 100）、`offset` |
 | `GET` | `/api/generations/{id}` | 作品详情。自己的，或已公开的 |
 | `PATCH` | `/api/generations/{id}` | 公开 / 取消公开。body `{isPublic}` |
@@ -212,6 +225,7 @@ ADMIN_USER=admin ADMIN_PASSWORD=your-password go run .
 | `POST` | `/api/admin/keys` | 新增 / 修改 Key |
 | `DELETE` | `/api/admin/keys/{id}` | 删除 Key |
 | `POST` | `/api/admin/keys/{id}/balance` | 向中转站查询并记录余额 |
+| `POST` | `/api/admin/keys/{id}/models` | 向中转站查询这把 Key 能用的模型 |
 | `PATCH` | `/api/admin/users/{id}` | 改用户额度，或停用 / 启用（`quota`、`disabled`） |
 | `POST` | `/api/admin/users/{id}/password` | 重置某个用户的密码 |
 | `DELETE` | `/api/admin/users/{id}` | 删除用户 |

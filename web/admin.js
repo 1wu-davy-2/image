@@ -17,7 +17,7 @@ const userStatus = document.querySelector("#userStatus");
 const keyRows = document.querySelector("#keyRows");
 const userRows = document.querySelector("#userRows");
 
-let state = { keys: [], users: [], settings: { checkinQuota: 5, generateCost: 1 } };
+let state = { keys: [], users: [], settings: { checkinMin: 5, checkinMax: 5, generateCost: 1 } };
 
 // 三块内容装在一个页面里，靠 hash 切。这样刷新和前进后退都能回到原来那一页，
 // 也不用为了三个菜单项多开三个 HTML。
@@ -67,6 +67,26 @@ function balanceText(key) {
   return "未查询";
 }
 
+// Key 名字底下那行模型说明。模型名可能很长，只列前几个。
+function modelLine(key) {
+  const line = document.createElement("div");
+  line.className = "sub";
+  const models = key.models || [];
+  if (key.modelsError) {
+    line.classList.add("bad-text");
+    line.textContent = `模型：${key.modelsError}`;
+    return line;
+  }
+  if (!models.length) {
+    line.textContent = "模型：还没拉取";
+    return line;
+  }
+  const ids = models.map((item) => item.id);
+  const head = ids.slice(0, 3).join("、");
+  line.textContent = `模型 ${ids.length} 个：${head}${ids.length > 3 ? " 等" : ""}`;
+  return line;
+}
+
 function fillForm(key) {
   document.querySelector("#keyId").value = key ? key.id : "";
   document.querySelector("#keyName").value = key ? key.name : "";
@@ -88,8 +108,9 @@ function renderStats() {
 }
 
 function render() {
-  document.querySelector("#checkinQuota").value = state.settings.checkinQuota;
-  document.querySelector("#generateCost").value = state.generateCost ?? state.settings.generateCost;
+  document.querySelector("#checkinMin").value = state.settings.checkinMin;
+  document.querySelector("#checkinMax").value = state.settings.checkinMax;
+  document.querySelector("#generateCost").value = state.settings.generateCost;
   renderStats();
   keyRows.replaceChildren();
   if (!state.keys.length) {
@@ -105,6 +126,7 @@ function render() {
     sub.className = "sub";
     sub.textContent = key.userAgent ? `UA: ${key.userAgent}` : "UA: 默认";
     name.append(sub);
+    name.append(modelLine(key));
     const kind = document.createElement("td");
     kind.textContent = PROTOCOL_LABEL[key.protocol] || key.protocol;
     const money = document.createElement("td");
@@ -142,12 +164,17 @@ function render() {
     refresh.className = "small";
     refresh.textContent = "刷新余额";
     refresh.addEventListener("click", () => refreshBalance(key.id, refresh));
+    const models = document.createElement("button");
+    models.type = "button";
+    models.className = "small";
+    models.textContent = "拉取模型";
+    models.addEventListener("click", () => refreshModels(key.id, models));
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "small";
     remove.textContent = "删除";
     remove.addEventListener("click", () => removeKey(key));
-    actions.append(edit, refresh, remove);
+    actions.append(edit, refresh, models, remove);
     row.append(name, kind, money, enabled, actions);
     keyRows.append(row);
   });
@@ -219,6 +246,22 @@ async function refreshBalance(id, button) {
     await api(`/api/admin/keys/${encodeURIComponent(id)}/balance`, { method: "POST", body: "{}" });
     await loadState();
     setStatus(keyStatus, "余额已更新。");
+  } catch (error) {
+    await loadState().catch(() => {});
+    setStatus(keyStatus, error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function refreshModels(id, button) {
+  button.disabled = true;
+  setStatus(keyStatus, "正在向中转站拉取模型…");
+  try {
+    const data = await api(`/api/admin/keys/${encodeURIComponent(id)}/models`, { method: "POST", body: "{}" });
+    await loadState();
+    const ids = (data.key.models || []).map((item) => item.id);
+    setStatus(keyStatus, `拉到 ${ids.length} 个模型：${ids.join("、")}`);
   } catch (error) {
     await loadState().catch(() => {});
     setStatus(keyStatus, error.message, true);
@@ -321,7 +364,8 @@ document.querySelector("#saveSettings").addEventListener("click", async () => {
     const data = await api("/api/admin/settings", {
       method: "PUT",
       body: JSON.stringify({
-        checkinQuota: Number(document.querySelector("#checkinQuota").value),
+        checkinMin: Number(document.querySelector("#checkinMin").value),
+        checkinMax: Number(document.querySelector("#checkinMax").value),
         generateCost: Number(document.querySelector("#generateCost").value),
       }),
     });

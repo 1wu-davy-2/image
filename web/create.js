@@ -10,6 +10,7 @@ const prefsKey = "darkroom.prefs";
 const MODELS = {
   gpt: [
     ["gpt-image-2.5-flare", "gpt-image-2.5-flare"],
+    ["gpt-image-2.5", "gpt-image-2.5"],
     ["gpt-image-1", "gpt-image-1"],
   ],
   nano: [
@@ -30,7 +31,17 @@ const HINTS = {
   "gemini-official": "使用「GEMINI官方直连-带生图」的 Key，走 Gemini 官方 generateContent。",
 };
 
+// 管理端「拉取模型」问来的、各调用方式下中转站实际支持的模型。
+// 拉不到就退回上面那份内置的，页面照样能用。
+let relayModels = null;
+
 const CHANNEL_LABEL = { async: "异步", sync: "同步", chat: "对话生图", gemini: "官方格式" };
+
+// 画幅 × 分辨率 算出具体像素。上游只认 "宽x高"，不认 "2K" 这种档位写法
+// （实测发 "2K" 会被打回「图片尺寸无效」），所以档位只是界面上的说法。
+// 长边定档，短边按比例算；这几个比例在这三档上都能整除。
+const TIER_LONG_SIDE = { "1K": 1024, "2K": 2048, "4K": 4096 };
+const GPT_RATIOS = { "1:1": [1, 1], "4:3": [4, 3], "3:4": [3, 4], "16:9": [16, 9] };
 
 const form = document.querySelector("#form");
 const protocol = document.querySelector("#protocol");
@@ -38,8 +49,10 @@ const protocolHint = document.querySelector("#protocolHint");
 const model = document.querySelector("#model");
 const customModel = document.querySelector("#customModel");
 const prompt = document.querySelector("#prompt");
-const size = document.querySelector("#size");
+const gptRatio = document.querySelector("#gptRatio");
+const gptResolution = document.querySelector("#gptResolution");
 const quality = document.querySelector("#quality");
+const pixelHint = document.querySelector("#pixelHint");
 const width = document.querySelector("#width");
 const height = document.querySelector("#height");
 const customSize = document.querySelector("#customSize");
@@ -68,6 +81,29 @@ const actions = document.querySelector("#actions");
 
 let tick = 0;
 let batchBusy = false;
+let batchLoaded = false;
+
+/* ---------- 画面 / 批量生图 两个标签 ---------- */
+
+const tabs = [...document.querySelectorAll(".tab")];
+
+function showTab(name) {
+  for (const tab of tabs) {
+    tab.setAttribute("aria-selected", String(tab.dataset.tab === name));
+  }
+  for (const panel of document.querySelectorAll("[data-panel]")) {
+    panel.classList.toggle("hidden", panel.dataset.panel !== name);
+  }
+  // 批量列表等真的切过去再拉，省得每次打开创作页都空跑一趟上游。
+  if (name === "batch" && !batchLoaded) {
+    batchLoaded = true;
+    loadBatches({ quiet: true });
+  }
+}
+
+for (const tab of tabs) {
+  tab.addEventListener("click", () => showTab(tab.dataset.tab));
+}
 
 function loadPrefs() {
   try {
@@ -76,7 +112,8 @@ function loadPrefs() {
     if (saved.model) model.dataset.prefer = saved.model;
     if (saved.customModel) customModel.value = saved.customModel;
     if (saved.quality) quality.value = saved.quality;
-    if (saved.size) size.value = saved.size;
+    if (saved.gptRatio) gptRatio.value = saved.gptRatio;
+    if (saved.gptResolution) gptResolution.value = saved.gptResolution;
     if (saved.width) width.value = saved.width;
     if (saved.height) height.value = saved.height;
     if (saved.aspectRatio) aspectRatio.value = saved.aspectRatio;
@@ -96,7 +133,8 @@ function savePrefs() {
     model: model.value,
     customModel: customModel.value.trim(),
     quality: quality.value,
-    size: size.value,
+    gptRatio: gptRatio.value,
+    gptResolution: gptResolution.value,
     width: width.value,
     height: height.value,
     aspectRatio: aspectRatio.value,
@@ -105,34 +143,76 @@ function savePrefs() {
   }));
 }
 
+// 当前调用方式下该显示哪些模型。中转站拉到了就用它，没有就用内置的那份。
+function modelSource() {
+  const relayed = relayModels ? relayModels[protocol.value] : null;
+  if (relayed && relayed.length) return { list: relayed, synced: true };
+  return {
+    list: (MODELS[protocol.value] || MODELS.gpt).map(([id, name]) => ({ id, name, available: true })),
+    synced: false,
+  };
+}
+
 function fillModels() {
-  const list = MODELS[protocol.value] || MODELS.gpt;
+  const { list, synced } = modelSource();
   const prefer = model.dataset.prefer || "";
+  // 拉取过就按实际情况来：不可用的禁掉，选不了就不会白跑一次。
+  const selectable = (item) => item.available || !synced;
+  const fallback = list.find(selectable) || list[0];
+
   model.replaceChildren();
-  for (const [value, label] of list) {
+  for (const item of list) {
     const option = document.createElement("option");
-    option.value = value;
-    option.textContent = label;
+    option.value = item.id;
+    option.textContent = item.available ? item.name : `${item.name}（没有可用 Key）`;
+    if (!selectable(item)) option.disabled = true;
     model.append(option);
   }
   const custom = document.createElement("option");
   custom.value = "custom";
   custom.textContent = "自定义";
   model.append(custom);
-  const known = list.some(([value]) => value === prefer);
-  model.value = known ? prefer : prefer === "custom" ? "custom" : list[0][0];
+
+  const known = list.find((item) => item.id === prefer && selectable(item));
+  model.value = known ? prefer : prefer === "custom" ? "custom" : fallback.id;
   if (model.value === "custom" && prefer && prefer !== "custom") customModel.value = customModel.value || prefer;
   delete model.dataset.prefer;
+
+  protocolHint.textContent = modelHint(synced, list);
+}
+
+function modelHint(synced, list) {
+  const base = HINTS[protocol.value] || "";
+  if (!synced) return `${base} 模型列表是内置的，去管理端点「拉取模型」可以换成中转站实际支持的那些。`;
+  const usable = list.filter((item) => item.available).length;
+  if (!usable) return `${base} 中转站报了 ${list.length} 个模型，但没有一把 Key 现在可用，先去管理端看看 Key 的余额和状态。`;
+  return `${base} 模型列表来自中转站，${usable} 个可用。`;
+}
+
+async function loadModels() {
+  try {
+    const response = await fetch(api("/api/models"), { credentials: "include" });
+    const data = await response.json().catch(() => ({}));
+    if (data.ok && data.models) relayModels = data.models;
+  } catch {
+    // 拉不到就用内置的，不打扰创作。
+  }
 }
 
 function syncFields() {
   const gemini = protocol.value !== "gpt";
+  const custom = gptResolution.value === "custom";
   customModel.classList.toggle("hidden", model.value !== "custom");
-  customSize.classList.toggle("hidden", size.value !== "custom" || gemini);
+  customSize.classList.toggle("hidden", gemini || !custom);
   pixelSize.classList.toggle("hidden", gemini);
   geminiSize.classList.toggle("hidden", !gemini);
   editFields.classList.toggle("hidden", form.querySelector('input[name="mode"]:checked').value !== "edit");
-  protocolHint.textContent = HINTS[protocol.value] || "";
+
+  pixelHint.classList.toggle("hidden", gemini);
+  pixelHint.textContent = gemini ? ""
+    : custom ? "单边不超过 8192 像素，总像素不超过 64Mi。"
+      : `发出 size = ${selectedSize()}。`;
+  // 协议提示归 fillModels 管——它才知道模型是从中转站拉的还是内置的。
 }
 
 function selectedModel() {
@@ -140,7 +220,10 @@ function selectedModel() {
 }
 
 function selectedSize() {
-  return size.value === "custom" ? `${Number(width.value)}x${Number(height.value)}` : size.value;
+  if (gptResolution.value === "custom") return `${Number(width.value)}x${Number(height.value)}`;
+  const [w, h] = GPT_RATIOS[gptRatio.value] || GPT_RATIOS["1:1"];
+  const long = TIER_LONG_SIDE[gptResolution.value] || TIER_LONG_SIDE["2K"];
+  return w >= h ? `${long}x${Math.round((long * h) / w)}` : `${Math.round((long * w) / h)}x${long}`;
 }
 
 function setStatus(message, isError) {
@@ -277,7 +360,9 @@ async function onSubmit(event) {
   }
 }
 
-form.addEventListener("change", () => {
+form.addEventListener("change", (event) => {
+  // 换调用方式要重新填模型下拉，不然还停在上一种方式的模型上。
+  if (event.target === protocol) fillModels();
   syncFields();
   savePrefs();
 });
@@ -437,8 +522,13 @@ batchSubmit.addEventListener("click", submitBatch);
 batchRefresh.addEventListener("click", () => loadBatches());
 
 loadPrefs();
+// 先用内置列表渲染一次，页面立刻能用；中转站那份拉回来之后再刷一遍。
 fillModels();
 syncFields();
-window.Darkroom.ready.then(() => loadBatches({ quiet: true }));
+showTab("draw");
+loadModels().then(() => {
+  fillModels();
+  syncFields();
+});
 
 })();

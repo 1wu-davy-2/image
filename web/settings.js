@@ -67,7 +67,7 @@ document.querySelector("#passwordForm").addEventListener("submit", async (event)
 
 document.querySelector("#logoutBtn").addEventListener("click", async () => {
   await fetch(api("/api/auth/logout"), { method: "POST", credentials: "include" });
-  window.location.replace("./login");
+  window.location.replace("./");
 });
 
 window.Darkroom.ready.then((session) => {

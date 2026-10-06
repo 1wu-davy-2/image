@@ -102,7 +102,8 @@ function renderUserMenu() {
   out.type = "button";
   out.addEventListener("click", async () => {
     await fetch(api("/api/auth/logout"), { method: "POST", credentials: "include" });
-    window.location.replace("./login");
+    // 退回介绍页，不直接甩到登录表单——退出的人多半只是想离开工作台。
+    window.location.replace("./");
   });
   panel.append(out);
 

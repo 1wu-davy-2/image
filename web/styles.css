@@ -124,6 +124,10 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
   align-items: start;
 }
 
+/* 首页用：两栏等宽铺满整宽，不把第一栏压在 420px 里。等高，不然两块的
+   下沿一高一低，整行看着是斜的。 */
+.layout-even { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; }
+
 .stack { display: grid; gap: 20px; }
 
 /* ---------- 卡片 ---------- */
@@ -254,6 +258,17 @@ button:focus-visible, .btn:focus-visible { outline: 2px solid color-mix(in oklab
 
 .row-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
+/* 长得像链接的按钮，用在卡片右上角那种次要入口。 */
+.link-button {
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--cyan-deep);
+  font-size: 13px;
+}
+.link-button:hover { background: transparent; border-color: transparent; text-decoration: underline; text-underline-offset: 3px; }
+
 /* ---------- 状态与徽章 ---------- */
 
 .status { min-height: 1.5em; margin: 12px 0 0; font-size: 14px; color: var(--ink-muted); }
@@ -287,6 +302,37 @@ tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover td { background: color-mix(in oklab, var(--rice) 35%, transparent); }
 .money { font-variant-numeric: tabular-nums; }
 .user-quota { width: 96px; }
+
+/* ---------- 页内标签（创作页：画面 / 批量生图） ---------- */
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid color-mix(in oklab, var(--line) 75%, transparent);
+}
+.tab {
+  position: relative;
+  height: 42px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink-muted);
+  font-size: 15px;
+}
+.tab:hover { background: transparent; border-color: transparent; color: var(--ink); }
+.tab[aria-selected="true"] { color: var(--ink); }
+/* 下划线压在 .tabs 的那条细线上，看着像是从里面挑出来的。 */
+.tab[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: -1px;
+  height: 2px;
+  background: var(--cyan-deep);
+}
 
 /* ---------- 生成台 ---------- */
 
@@ -357,6 +403,53 @@ details.docs summary:hover { color: var(--ink); }
 
 .narrow { max-width: 440px; margin: 40px auto; }
 .center { text-align: center; }
+
+/* ---------- 弹窗（签到记录） ---------- */
+
+.dialog {
+  width: min(440px, calc(100vw - 40px));
+  padding: 20px 22px;
+  border: 1px solid color-mix(in oklab, var(--ink) 12%, transparent);
+  border-radius: var(--radius-xl);
+  background: color-mix(in oklab, var(--mist) 92%, var(--rice));
+  color: var(--ink);
+  box-shadow: 0 30px 70px -30px rgba(60, 55, 47, 0.5);
+}
+.dialog::backdrop { background: color-mix(in oklab, var(--ink) 38%, transparent); }
+
+.dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.dialog-head h3 { margin: 0; font-size: 15px; letter-spacing: 0.16em; color: var(--ink-muted); font-weight: 500; }
+
+.dialog-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid color-mix(in oklab, var(--line) 70%, transparent);
+}
+.dialog .status { margin: 8px 0 0; }
+
+.log-list { max-height: 46vh; overflow-y: auto; margin-top: 12px; }
+.log-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 2px;
+  border-bottom: 1px solid color-mix(in oklab, var(--line) 60%, transparent);
+  font-size: 14px;
+}
+.log-row:last-child { border-bottom: 0; }
+.log-day { color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+.log-amount { color: var(--cyan-deep); font-variant-numeric: tabular-nums; }
 
 /* ---------- 工具类 ---------- */
 
@@ -561,6 +654,19 @@ body.login-page { display: flex; flex-direction: column; min-height: 100dvh; }
 
 body.studio-page { display: flex; flex-direction: column; min-height: 100dvh; }
 .shell { flex: 1; }
+
+/* 工作台底下铺一层很淡的敦煌。固定在视口上，滚动时不动，也不吃点击；
+   内容层抬到它上面（.top 本来就有 z-index: 20）。 */
+body.studio-page::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background: url("./art/hero-wide.jpg") center 30% / cover no-repeat;
+  opacity: 0.09;
+  pointer-events: none;
+}
+body.studio-page .shell { position: relative; z-index: 1; }
 
 .sidebar {
   display: flex;

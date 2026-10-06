@@ -42,7 +42,12 @@
           <p>选一种调用方式，写下画面。生成的图会自动收进作品集。</p>
         </div>
 
-        <div class="layout">
+        <div class="tabs" role="tablist" aria-label="创作方式">
+          <button type="button" class="tab" role="tab" data-tab="draw" aria-selected="true">画面</button>
+          <button type="button" class="tab" role="tab" data-tab="batch" aria-selected="false">批量生图</button>
+        </div>
+
+        <div class="layout" data-panel="draw">
           <div class="stack">
             <form id="form" class="card">
               <div class="card-head">
@@ -84,26 +89,33 @@
 
               <div id="pixelSize" class="split">
                 <div>
-                  <label for="size">尺寸</label>
-                  <select id="size" name="size">
-                    <option value="1024x1024">1:1 · 1024×1024</option>
-                    <option value="1024x1536">2:3 · 1024×1536</option>
-                    <option value="1536x1024">3:2 · 1536×1024</option>
-                    <option value="1024x1792">9:16 · 1024×1792</option>
-                    <option value="1792x1024">16:9 · 1792×1024</option>
-                    <option value="2048x2048">1:1 · 2048×2048</option>
+                  <label for="gptRatio">画幅</label>
+                  <select id="gptRatio" name="gptRatio">
+                    <option value="1:1">1:1</option>
+                    <option value="4:3">4:3</option>
+                    <option value="3:4">3:4</option>
+                    <option value="16:9">16:9</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="gptResolution">分辨率</label>
+                  <select id="gptResolution" name="gptResolution">
+                    <option value="1K">1K</option>
+                    <option value="2K" selected>2K</option>
+                    <option value="4K">4K</option>
                     <option value="custom">自定义</option>
                   </select>
                 </div>
                 <div>
                   <label for="quality">质量</label>
                   <select id="quality" name="quality">
-                    <option value="medium" selected>medium</option>
-                    <option value="high">high</option>
-                    <option value="auto">auto</option>
+                    <option value="medium" selected>标准</option>
+                    <option value="high">高清</option>
+                    <option value="auto">自动</option>
                   </select>
                 </div>
               </div>
+              <p id="pixelHint" class="hint"></p>
 
               <div id="geminiSize" class="split hidden">
                 <div>
@@ -147,8 +159,11 @@
               <details class="docs">
                 <summary>中转站怎么调用</summary>
                 <div class="docs-body">
-                  <p>用户每天签到领取额度，生图时扣额度。GPT、Nano Banana、Gemini 官方直连的 Key 和剩余余额在 <a href="./admin">管理端</a> 维护。服务端用还有余额的 Key 去请求中转站。</p>
-                  <p><strong>GPT 生图</strong>：<code>POST /v1/images/generations</code>，编辑是 <code>/v1/images/edits</code>。先走异步再轮询 <code>/v1/images/tasks/{task_id}</code>，异步不存在时改同步。字段有 <code>model</code>、<code>prompt</code>、<code>size</code>、<code>quality</code>。示例模型 <code>gpt-image-2.5-flare</code>、<code>gpt-image-1</code>。</p>
+                  <p>用户每天签到领取额度，生图时扣额度。GPT、Nano Banana、Gemini 官方直连的 Key 和剩余余额在管理端维护，只有管理员进得去。服务端用还有余额的 Key 去请求中转站。</p>
+                  <p><strong>GPT 生图</strong>：<code>POST /v1/images/generations</code>，编辑是 <code>/v1/images/edits</code>。先走异步再轮询 <code>/v1/images/tasks/{task_id}</code>，异步不存在时改同步。字段有 <code>model</code>、<code>prompt</code>、<code>size</code>、<code>quality</code>。
+<code>size</code> 只认具体像素（<code>2048x1536</code>），发 <code>2K</code> 这种档位会被打回；
+单边不超过 8192 像素，总像素不超过 64Mi。示例模型 <code>gpt-image-2.5-flare</code>、<code>gpt-image-2.5</code>、<code>gpt-image-1</code>；
+                    哪几个真的能用，取决于中转站那把 Key 所属的分组。</p>
                   <p><strong>Nano Banana</strong>：同一套生图接口，模型用 <code>gemini-2.5-flash-image</code>（香蕉）、<code>gemini-3-pro-image</code>、<code>gemini-3.1-flash-image</code>。生图接口不收这个模型时，改走 <code>POST /v1/chat/completions</code>，和 UU 控制台对 Gemini 分组的做法一致。</p>
                   <p><strong>GEMINI官方直连-带生图</strong>：<code>POST /v1beta/models/{模型}:generateContent</code>。正文是 Gemini 官方格式，<code>generationConfig.responseModalities</code> 含 <code>IMAGE</code>，画幅和分辨率放在 <code>imageConfig</code>。参考图以 <code>inlineData</code> 放进 <code>contents</code>。</p>
                   <p><strong>Gemini 批量生图</strong>：<code>POST /v1/images/batches</code>，正文是 <code>model</code>、<code>provider</code>、<code>items</code>。之后用 <code>GET /v1/images/batches/{id}</code> 查状态、<code>/items</code> 看条目、<code>/download</code> 取 ZIP，还能 <code>/cancel</code> 取消。这一族要单独配一把「Gemini 批量生图」类型的 Key。</p>
@@ -172,46 +187,46 @@
               <div id="actions" class="row-actions hidden spaced"></div>
             </div>
           </section>
-
-          <section class="card batch" aria-label="批量生图">
-            <div class="card-head">
-              <h3>批量生图</h3>
-            </div>
-            <p class="hint">走 Gemini 批量接口，一次提交多条。提交时按条目数扣额度，上游受理后不退还。</p>
-
-            <div class="split">
-              <div>
-                <label for="batchModel">模型</label>
-                <input id="batchModel" value="gemini-2.5-flash-image" spellcheck="false" />
-              </div>
-              <div>
-                <label for="batchSize">分辨率</label>
-                <select id="batchSize">
-                  <option value="1K">1K</option>
-                  <option value="2K">2K</option>
-                  <option value="4K">4K</option>
-                </select>
-              </div>
-              <div>
-                <label for="batchProvider">provider</label>
-                <select id="batchProvider">
-                  <option value="gemini_api">gemini_api</option>
-                  <option value="vertex">vertex</option>
-                </select>
-              </div>
-            </div>
-
-            <label for="batchPrompts">提示词（一行一条）</label>
-            <textarea id="batchPrompts" rows="4" placeholder="A clean product hero image&#10;A lighthouse during a winter storm"></textarea>
-
-            <div class="row-actions spaced">
-              <button type="button" id="batchSubmit" class="primary">提交批量任务</button>
-              <button type="button" id="batchRefresh">刷新列表</button>
-            </div>
-            <p id="batchStatus" class="status" role="status" aria-live="polite"></p>
-            <div id="batchList" class="batches"></div>
-          </section>
         </div>
+
+        <section class="card hidden" data-panel="batch" aria-label="批量生图">
+          <div class="card-head">
+            <h3>批量生图</h3>
+          </div>
+          <p class="hint">走 Gemini 批量接口，一次提交多条。提交时按条目数扣额度，上游受理后不退还。</p>
+
+          <div class="split">
+            <div>
+              <label for="batchModel">模型</label>
+              <input id="batchModel" value="gemini-2.5-flash-image" spellcheck="false" />
+            </div>
+            <div>
+              <label for="batchSize">分辨率</label>
+              <select id="batchSize">
+                <option value="1K">1K</option>
+                <option value="2K">2K</option>
+                <option value="4K">4K</option>
+              </select>
+            </div>
+            <div>
+              <label for="batchProvider">provider</label>
+              <select id="batchProvider">
+                <option value="gemini_api">gemini_api</option>
+                <option value="vertex">vertex</option>
+              </select>
+            </div>
+          </div>
+
+          <label for="batchPrompts">提示词（一行一条）</label>
+          <textarea id="batchPrompts" rows="4" placeholder="A clean product hero image&#10;A lighthouse during a winter storm"></textarea>
+
+          <div class="row-actions spaced">
+            <button type="button" id="batchSubmit" class="primary">提交批量任务</button>
+            <button type="button" id="batchRefresh">刷新列表</button>
+          </div>
+          <p id="batchStatus" class="status" role="status" aria-live="polite"></p>
+          <div id="batchList" class="batches"></div>
+        </section>
       </main>
     </div>
 

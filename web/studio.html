@@ -42,65 +42,51 @@
           <p id="subtitle">每天签到领额度，攒够了就去创作。</p>
         </div>
 
-        <div class="layout">
-          <div class="stack">
-            <section class="card" aria-label="额度与签到">
-              <div class="card-head">
-                <h3>额度</h3>
-              </div>
-              <div class="card-head">
-                <div>
-                  <span class="eyebrow">剩余</span>
-                  <div><strong id="quota" class="quota-number">0</strong> <span class="hint-inline">额度</span></div>
-                </div>
-                <button type="button" id="checkinBtn" class="primary small">签到领额度</button>
-              </div>
-              <p id="checkinHint" class="hint"></p>
-              <div class="hairline"></div>
-              <div class="row-actions">
-                <a class="btn primary" href="./create">去创作</a>
-                <a class="btn" href="./gallery">看作品集</a>
-              </div>
-            </section>
-
-            <section class="card" aria-label="账号">
-              <div class="card-head">
-                <h3>账号</h3>
-              </div>
-              <div class="split">
-                <div>
-                  <label>名称</label>
-                  <p id="accountName" class="account-value">—</p>
-                </div>
-                <div>
-                  <label>中文名</label>
-                  <p id="accountDisplay" class="account-value">—</p>
-                </div>
-                <div>
-                  <label>邮箱</label>
-                  <p id="accountEmail" class="account-value">—</p>
-                </div>
-                <div>
-                  <label>手机号</label>
-                  <p id="accountPhone" class="account-value">—</p>
-                </div>
-              </div>
-              <p class="hint">账号信息定了就不让改。想改中文名去<a href="./settings">系统设置</a>。</p>
-            </section>
-          </div>
-
-          <section class="stage" aria-label="最近作品">
-            <div class="card">
-              <div class="card-head">
-                <h3>最近</h3>
-                <a href="./gallery" class="hint-inline">全部作品 →</a>
-              </div>
-              <div id="recent" class="work-grid work-grid-tight"></div>
+        <div class="layout layout-even">
+          <section class="card" aria-label="额度与签到">
+            <div class="card-head">
+              <h3>额度</h3>
+              <button type="button" id="checkinLogBtn" class="link-button">签到记录 →</button>
             </div>
+            <div class="card-head">
+              <div>
+                <span class="eyebrow">剩余</span>
+                <div><strong id="quota" class="quota-number">0</strong> <span class="hint-inline">额度</span></div>
+              </div>
+              <button type="button" id="checkinBtn" class="primary small">签到领额度</button>
+            </div>
+            <p id="checkinHint" class="hint"></p>
+            <div class="hairline"></div>
+            <div class="row-actions">
+              <a class="btn primary" href="./create">去创作</a>
+              <a class="btn" href="./gallery">看作品集</a>
+            </div>
+          </section>
+
+          <section class="card" aria-label="最近作品">
+            <div class="card-head">
+              <h3>最近</h3>
+              <a href="./gallery" class="hint-inline">全部作品 →</a>
+            </div>
+            <div id="recent" class="work-grid work-grid-tight"></div>
           </section>
         </div>
       </main>
     </div>
+
+    <dialog id="checkinDialog" class="dialog">
+      <div class="dialog-head">
+        <h3>签到记录</h3>
+        <button type="button" id="checkinClose" class="ghost">关闭</button>
+      </div>
+      <div id="checkinLog" class="log-list"></div>
+      <div class="dialog-foot">
+        <button type="button" id="checkinPrev" class="small">上一页</button>
+        <span id="checkinPage" class="hint-inline"></span>
+        <button type="button" id="checkinNext" class="small">下一页</button>
+      </div>
+      <p id="checkinLogStatus" class="status" role="status"></p>
+    </dialog>
 
     <script src="./config.js"></script>
     <script src="./shell.js"></script>

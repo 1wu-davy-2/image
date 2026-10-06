@@ -187,14 +187,19 @@
                 <h3>签到规则</h3>
                 <div class="split">
                   <div>
-                    <label for="checkinQuota">每日签到领取额度</label>
-                    <input id="checkinQuota" type="number" min="0" max="1000" step="1" />
+                    <label for="checkinMin">签到领取额度（最少）</label>
+                    <input id="checkinMin" type="number" min="0" max="1000" step="1" />
+                  </div>
+                  <div>
+                    <label for="checkinMax">签到领取额度（最多）</label>
+                    <input id="checkinMax" type="number" min="0" max="1000" step="1" />
                   </div>
                   <div>
                     <label for="generateCost">每次生图消耗额度</label>
                     <input id="generateCost" type="number" min="0" max="1000" step="1" />
                   </div>
                 </div>
+                <p class="hint">签到时在这个区间里随机给。两个数填一样就是固定额度。</p>
                 <div class="row-actions spaced">
                   <button type="button" id="saveSettings" class="primary">保存规则</button>
                 </div>
