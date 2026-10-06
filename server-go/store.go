@@ -169,11 +169,12 @@ type Checkin struct {
 }
 
 type AdminState struct {
-	Settings    Settings    `json:"settings"`
-	Keys        []Key       `json:"keys"`
-	Users       []User      `json:"users"`
-	ModelTypes  []ModelType `json:"modelTypes"`
-	CheckinDate string      `json:"checkinDate"`
+	Settings    Settings           `json:"settings"`
+	Keys        []Key              `json:"keys"`
+	Users       []User             `json:"users"`
+	ModelTypes  []ModelType        `json:"modelTypes"`
+	ModelRates  map[string]float64 `json:"modelRates"`
+	CheckinDate string             `json:"checkinDate"`
 }
 
 type Store struct {
@@ -293,6 +294,24 @@ CREATE TABLE IF NOT EXISTS model_types (
   multiplier    REAL NOT NULL DEFAULT 1,
   updated_at    TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS model_rates (
+  model_id   TEXT PRIMARY KEY,
+  multiplier REAL NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id         TEXT PRIMARY KEY,
+  actor_kind TEXT NOT NULL DEFAULT 'user',
+  actor_id   TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  action     TEXT NOT NULL,
+  target     TEXT NOT NULL DEFAULT '',
+  detail     TEXT NOT NULL DEFAULT '',
+  ip         TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_logs_created ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS audit_logs_action ON audit_logs(action, created_at DESC);
 INSERT OR IGNORE INTO settings (id) VALUES (1);
 `)
 	if err != nil {
@@ -1420,6 +1439,65 @@ func (s *Store) modelType(name string) (ModelType, error) {
 	return ModelType{}, fail(400, "不认识的生图类型")
 }
 
+// modelRates 返回所有设过的模型倍率。没设过的模型不在里面，取的时候按 1.0 算。
+func (s *Store) modelRates() (map[string]float64, error) {
+	rows, err := s.db.Query(`SELECT model_id, multiplier FROM model_rates`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]float64{}
+	for rows.Next() {
+		var id string
+		var rate float64
+		if err := rows.Scan(&id, &rate); err != nil {
+			return nil, err
+		}
+		out[id] = rate
+	}
+	return out, rows.Err()
+}
+
+// modelMultiplier 取一个模型的倍率，没设过就是 1.0——1.0 是乘法里的单位元，
+// 不设就等于「这个模型不加价」，类型那一层的倍率照旧生效。
+func (s *Store) modelMultiplier(modelID string) (float64, error) {
+	if modelID == "" {
+		return 1, nil
+	}
+	var rate float64
+	err := s.db.QueryRow(`SELECT multiplier FROM model_rates WHERE model_id = ?`, modelID).Scan(&rate)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if rate <= 0 {
+		return 1, nil
+	}
+	return rate, nil
+}
+
+func (s *Store) saveModelRate(modelID string, multiplier float64) (map[string]float64, error) {
+	modelID = strings.TrimSpace(modelID)
+	if !modelRe.MatchString(modelID) {
+		return nil, fail(400, "模型名不合法")
+	}
+	if multiplier < 0.1 || multiplier > 100 {
+		return nil, fail(400, "倍率请填 0.1 到 100 之间")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec(
+		`INSERT INTO model_rates (model_id, multiplier, updated_at) VALUES (?, ?, ?)
+		 ON CONFLICT(model_id) DO UPDATE SET multiplier = excluded.multiplier, updated_at = excluded.updated_at`,
+		modelID, multiplier, s.now(),
+	); err != nil {
+		return nil, err
+	}
+	return s.modelRates()
+}
+
 func (s *Store) saveModelType(name, defaultModel string, multiplier float64) (ModelType, error) {
 	if !validModelType(name) {
 		return ModelType{}, fail(400, "不认识的生图类型")
@@ -1446,9 +1524,10 @@ func (s *Store) saveModelType(name, defaultModel string, multiplier float64) (Mo
 // 挑中那把的 protocol 决定这次请求走什么形状。
 //
 // 分三档挑，档内还是按余额和最近最少用排：
-//   1. 模型列表里确实有这个默认模型的
-//   2. 还没拉过模型列表的（不知道支不支持，不能用「不知道」当理由排除掉）
-//   3. 拉了列表但里面没有这个模型的
+//  1. 模型列表里确实有这个默认模型的
+//  2. 还没拉过模型列表的（不知道支不支持，不能用「不知道」当理由排除掉）
+//  3. 拉了列表但里面没有这个模型的
+//
 // 第三档留着不删是为了兜底：模型列表可能是旧的，硬排除会让用户直接生不了图。
 // 但只要有前两档，就先不用它——中转站按分组给模型，配了 Key 不代表这把 Key 的
 // 账号支持这个模型，挑错了用户收到的就是「not supported by any configured account」
@@ -1519,13 +1598,26 @@ func (s *Store) reserveGeneration(userID, protocol string, units int) (Key, int,
 
 // reserveForType 按生图类型扣额度并锁定一把 Key，返回那把 Key（它的 protocol
 // 决定请求形状）和这个类型的设置（默认模型、倍率）。
-func (s *Store) reserveForType(userID, modelType string, units int) (Key, ModelType, int, int, error) {
+//
+// wantModel 是这次实际要用的模型，用户手动选过就是它，没选就传空、用类型的默认模型。
+// 挑 Key 时按这个模型找，不是按默认模型——用户特意挑了个别的模型，
+// 挑到一把没这个模型的 Key 就白挑了。
+//
+// 倍率是两层相乘：类型的倍率 × 模型的倍率。模型没设过就是 1.0，等于不加价。
+func (s *Store) reserveForType(userID, modelType, wantModel string, units int) (Key, ModelType, int, int, error) {
 	item, err := s.modelType(modelType)
 	if err != nil {
 		return Key{}, ModelType{}, 0, 0, err
 	}
-	key, cost, quota, err := s.reserve(userID, item.Multiplier, units, func() (Key, error) {
-		return s.pickKeyForType(modelType, item.DefaultModel)
+	if wantModel == "" {
+		wantModel = item.DefaultModel
+	}
+	rate, err := s.modelMultiplier(wantModel)
+	if err != nil {
+		return Key{}, ModelType{}, 0, 0, err
+	}
+	key, cost, quota, err := s.reserve(userID, item.Multiplier*rate, units, func() (Key, error) {
+		return s.pickKeyForType(modelType, wantModel)
 	})
 	if err != nil {
 		return Key{}, ModelType{}, 0, 0, err
@@ -1615,9 +1707,13 @@ func (s *Store) adminState() (AdminState, error) {
 	if err != nil {
 		return AdminState{}, err
 	}
+	rates, err := s.modelRates()
+	if err != nil {
+		return AdminState{}, err
+	}
 	return AdminState{
 		Settings: settings, Keys: keys, Users: users,
-		ModelTypes: types, CheckinDate: todayShanghai(),
+		ModelTypes: types, ModelRates: rates, CheckinDate: todayShanghai(),
 	}, nil
 }
 
@@ -1765,9 +1861,10 @@ func (s *Store) saveGeneration(in GenerationInput) (Generation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := newID()
+	// 新图默认公开：画坊那页本来就是给人看的，想藏起来的人自己去作品集点「取消公开」。
 	if _, err := s.db.Exec(`INSERT INTO generations
 		(id, user_id, prompt, protocol, model, size_label, channel, task_id, is_public, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
 		id, in.UserID, in.Prompt, in.Protocol, in.Model, in.SizeLabel, in.Channel, in.TaskID, s.now()); err != nil {
 		return Generation{}, err
 	}
@@ -1918,4 +2015,104 @@ func (s *Store) fillGenerationImages(generationID string) {
 		}
 		s.mu.Unlock()
 	}
+}
+
+/* ---------- 审计日志 ---------- */
+
+// AuditEntry 一条审计记录：谁、什么时候、对什么、做了什么。
+// actor_kind 是 user 或 admin——管理端和用户端是两套会话，混在一起看不出是谁干的。
+type AuditEntry struct {
+	ID        string `json:"id"`
+	ActorKind string `json:"actorKind"`
+	ActorID   string `json:"actorId"`
+	ActorName string `json:"actorName"`
+	Action    string `json:"action"`
+	Target    string `json:"target"`
+	Detail    string `json:"detail"`
+	IP        string `json:"ip"`
+	CreatedAt string `json:"createdAt"`
+}
+
+// audit 落一条审计。写失败只返回错误让调用方记服务端日志，不往上抛——
+// 审计是旁路，不能因为它自己写不进去就把已经成功的签到、生图搅黄。
+func (s *Store) audit(entry AuditEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`INSERT INTO audit_logs
+		(id, actor_kind, actor_id, actor_name, action, target, detail, ip, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		newID(), entry.ActorKind, entry.ActorID, entry.ActorName,
+		entry.Action, entry.Target, entry.Detail, entry.IP, s.now())
+	return err
+}
+
+// auditLogs 按发生顺序倒序翻页。action 传空就是全部。
+//
+// 排序用 rowid 而不是 created_at：created_at 只到秒，同一秒里连着发生的几件事
+// （登录完立刻改设置再登出）时间戳一模一样，按它排就乱套了——而审计要看的
+// 恰恰是这个先后。rowid 是插入顺序，只增不减，正合适。
+func (s *Store) auditLogs(action string, limit, offset int) ([]AuditEntry, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	where := ""
+	args := []any{}
+	if action != "" {
+		where = " WHERE action = ?"
+		args = append(args, action)
+	}
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM audit_logs`+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	pageArgs := append(append([]any{}, args...), limit, offset)
+	rows, err := s.db.Query(`SELECT id, actor_kind, actor_id, actor_name, action, target, detail, ip, created_at
+		FROM audit_logs`+where+` ORDER BY rowid DESC LIMIT ? OFFSET ?`, pageArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []AuditEntry{}
+	for rows.Next() {
+		var item AuditEntry
+		if err := rows.Scan(&item.ID, &item.ActorKind, &item.ActorID, &item.ActorName,
+			&item.Action, &item.Target, &item.Detail, &item.IP, &item.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, item)
+	}
+	return out, total, rows.Err()
+}
+
+// auditActions 已经出现过的动作，给筛选下拉用。写死的列表会跟写入点对不上，
+// 这里直接从记录里取，多一个动作下拉里就多一项。
+func (s *Store) auditActions() ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT DISTINCT action FROM audit_logs ORDER BY action`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var action string
+		if err := rows.Scan(&action); err != nil {
+			return nil, err
+		}
+		out = append(out, action)
+	}
+	return out, rows.Err()
+}
+
+// adminName 管理端账号名。审计里管理员那一行要写清楚是谁在操作。
+func (s *Store) adminName() string {
+	var name string
+	if err := s.db.QueryRow(`SELECT username FROM admin WHERE id = 1`).Scan(&name); err != nil {
+		return "管理端"
+	}
+	if strings.TrimSpace(name) == "" {
+		return "管理端"
+	}
+	return name
 }

@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -79,6 +82,13 @@ func main() {
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
+	// 后台定时去中转站问余额和模型。管理端那两个手动按钮还在，这个是兜底：
+	// 余额和模型都不刷新的话，挑 Key 一直按旧数据挑——钱花完了还在挑它，
+	// 模型下架了还在发它，用户收到的都是看不懂的上游报错。
+	bg, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+	go srv.refreshLoop(bg)
+
 	go func() {
 		fmt.Printf("暗房（Go）已启动 http://127.0.0.1:%s\n", port)
 		fmt.Printf("管理端 http://127.0.0.1:%s/admin\n", port)
@@ -90,9 +100,55 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
+	stopBackground()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	httpServer.Shutdown(ctx)
+}
+
+// keyRefreshInterval 是后台刷余额和模型的间隔。
+const keyRefreshInterval = 5 * time.Minute
+
+// refreshLoop 定时把所有启用的 Key 的余额和模型从中转站拉一遍。
+func (s *server) refreshLoop(ctx context.Context) {
+	// 起来就先拉一遍，省得刚启动那几分钟用的是上次退出前的旧数据。
+	s.refreshAllKeys(ctx)
+	ticker := time.NewTicker(keyRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.refreshAllKeys(ctx)
+		}
+	}
+}
+
+// refreshAllKeys 逐个拉。串行是有意的：一次开十几路请求打中转站，
+// 容易被当成异常流量，而且日志会搅成一团分不清哪把 Key 出的问题。
+func (s *server) refreshAllKeys(ctx context.Context) {
+	keys, err := s.store.keys()
+	if err != nil {
+		log.Printf("[refresh] 读 Key 失败：%v", err)
+		return
+	}
+	for _, key := range keys {
+		if ctx.Err() != nil {
+			return
+		}
+		// 停用的 Key 不参与挑 Key，没必要为它花请求。
+		if !key.Enabled || key.APIKey == "" {
+			continue
+		}
+		// 两个各自成败，互不牵连：余额查得到、模型拉不到是常事。
+		if _, err := s.refreshBalanceOf(ctx, key); err != nil {
+			log.Printf("[refresh] %s 余额：%v", key.Name, err)
+		}
+		if _, err := s.refreshModelsOf(ctx, key); err != nil {
+			log.Printf("[refresh] %s 模型：%v", key.Name, err)
+		}
+	}
 }
 
 /* ---------- 路由 ---------- */
@@ -145,9 +201,11 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/admin/keys/{id}/balance", s.wrap(s.adminRefreshBalance))
 	mux.HandleFunc("POST /api/admin/keys/{id}/models", s.wrap(s.adminRefreshModels))
 	mux.HandleFunc("PUT /api/admin/types/{type}", s.wrap(s.adminSaveType))
+	mux.HandleFunc("PUT /api/admin/models/{id}", s.wrap(s.adminSaveModelRate))
 	mux.HandleFunc("PATCH /api/admin/users/{id}", s.wrap(s.adminPatchUser))
 	mux.HandleFunc("DELETE /api/admin/users/{id}", s.wrap(s.adminDeleteUser))
 	mux.HandleFunc("POST /api/admin/users/{id}/password", s.wrap(s.adminResetUserPassword))
+	mux.HandleFunc("GET /api/admin/audit", s.wrap(s.adminAudit))
 
 	// 其余路径当静态文件；不匹配的方法走这里也会被挡掉。
 	mux.HandleFunc("/", s.wrap(s.static))
@@ -291,6 +349,47 @@ func (s *server) requireUser(r *http.Request) (*User, error) {
 		return nil, fail(401, "请先登录")
 	}
 	return user, nil
+}
+
+/* ---------- 审计 ---------- */
+
+// clientIP 取来访地址。服务只监听 127.0.0.1，所以这儿拿到的基本都是本机；
+// 去掉端口，日志里好看。
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// audit 记一笔审计。写失败只在服务端日志里留痕，绝不往上抛——
+// 这些调用都发生在正事已经办成之后，不能因为审计写不进去就把结果吞了。
+func (s *server) audit(r *http.Request, entry AuditEntry) {
+	entry.IP = clientIP(r)
+	if err := s.store.audit(entry); err != nil {
+		log.Printf("写审计日志失败：%v", err)
+	}
+}
+
+// auditUser 记用户端的操作。拿不到人就不记——匿名请求没有审计价值。
+func (s *server) auditUser(r *http.Request, user *User, action, target, detail string) {
+	if user == nil {
+		return
+	}
+	s.audit(r, AuditEntry{
+		ActorKind: "user", ActorID: user.ID, ActorName: user.Username,
+		Action: action, Target: target, Detail: detail,
+	})
+}
+
+// auditAdmin 记管理端的操作。管理端是独立的一套账号，没有用户行，
+// 名字从 admin 表里取。
+func (s *server) auditAdmin(r *http.Request, action, target, detail string) {
+	s.audit(r, AuditEntry{
+		ActorKind: "admin", ActorName: s.store.adminName(),
+		Action: action, Target: target, Detail: detail,
+	})
 }
 
 func (s *server) requireAdmin(r *http.Request) error {
@@ -498,6 +597,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	s.auditUser(r, &user, "注册", user.Username, "来自 "+clientIP(r))
 	writeJSON(w, 200, map[string]any{"ok": true, "user": user}, sessionCookie(userCookieName, token))
 	return nil
 }
@@ -508,10 +608,14 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	// account 既收名称也收邮箱。
-	user, token, err := s.store.login(firstString(body["account"]), firstString(body["password"]))
+	account := firstString(body["account"])
+	user, token, err := s.store.login(account, firstString(body["password"]))
 	if err != nil {
+		// 登不上的也记一笔：连着几十条同一个账号的失败，就是要看出来的东西。
+		s.audit(r, AuditEntry{ActorKind: "user", ActorName: account, Action: "登录失败", Target: account, Detail: err.Error()})
 		return err
 	}
+	s.auditUser(r, &user, "登录", user.Username, "")
 	writeJSON(w, 200, map[string]any{"ok": true, "user": user}, sessionCookie(userCookieName, token))
 	return nil
 }
@@ -530,14 +634,21 @@ func (s *server) updateMe(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	s.auditUser(r, user, "改名", updated.Username, "改成「"+updated.DisplayName+"」")
 	writeJSON(w, 200, map[string]any{"ok": true, "user": updated})
 	return nil
 }
 
 func (s *server) logout(w http.ResponseWriter, r *http.Request) error {
+	// 得在踢掉会话之前把人认出来，不然登出记录里就没名字了。
+	user, err := s.store.sessionUser(cookieValue(r, userCookieName))
+	if err != nil {
+		return err
+	}
 	if err := s.store.logout(cookieValue(r, userCookieName)); err != nil {
 		return err
 	}
+	s.auditUser(r, user, "登出", "", "")
 	writeJSON(w, 200, map[string]any{"ok": true}, sessionCookie(userCookieName, ""))
 	return nil
 }
@@ -583,6 +694,7 @@ func (s *server) checkin(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	s.auditUser(r, user, "签到", "", fmt.Sprintf("+%d 额度，共 %d", amount, updated.Quota))
 	writeJSON(w, 200, map[string]any{"ok": true, "amount": amount, "user": updated})
 	return nil
 }
@@ -614,6 +726,7 @@ func (s *server) changeMyPassword(w http.ResponseWriter, r *http.Request) error 
 	if err := s.store.changeUserPassword(user.ID, firstString(body["oldPassword"]), firstString(body["newPassword"])); err != nil {
 		return err
 	}
+	s.auditUser(r, user, "改密码", user.Username, "")
 	writeJSON(w, 200, map[string]any{"ok": true})
 	return nil
 }
@@ -640,14 +753,22 @@ func (s *server) generateHandler(w http.ResponseWriter, r *http.Request) error {
 		if !validModelType(modelType) {
 			return fail(400, "不认识的生图类型")
 		}
+		// 模型可以不选：不选就用管理端给这个类型配的默认模型。
+		wantModel := strings.TrimSpace(firstString(body["model"]))
 		var picked ModelType
-		key, picked, cost, quota, err = s.store.reserveForType(user.ID, modelType, 1)
+		key, picked, cost, quota, err = s.store.reserveForType(user.ID, modelType, wantModel, 1)
 		if err != nil {
 			return err
 		}
 		protocol = key.Protocol
-		// 模型不由用户选，用这个类型的默认模型。
-		body["model"] = picked.DefaultModel
+		if wantModel == "" {
+			wantModel = picked.DefaultModel
+		}
+		if wantModel == "" {
+			refunded := s.store.refund(user.ID, cost)
+			return &httpError{status: 400, msg: "管理端还没给这个类型配默认模型，去「生图类型」里填一个，或自己选一个模型。", quota: &refunded}
+		}
+		body["model"] = wantModel
 	} else {
 		protocol, err = parseProtocol(body["protocol"])
 		if err != nil {
@@ -667,6 +788,9 @@ func (s *server) generateHandler(w http.ResponseWriter, r *http.Request) error {
 	spec, err := buildSpec(r.Context(), body, protocol)
 	if err != nil {
 		refunded := s.store.refund(user.ID, cost)
+		// 规格都没建起来，spec 是空的，模型名只能从请求里取。
+		s.auditUser(r, user, "生图失败", firstString(body["model"]),
+			fmt.Sprintf("扣的 %d 额度已退回：%s", cost, err.Error()))
 		var typed *httpError
 		if errors.As(err, &typed) {
 			typed.quota = &refunded
@@ -678,6 +802,7 @@ func (s *server) generateHandler(w http.ResponseWriter, r *http.Request) error {
 	result, genErr := generate(r.Context(), cred, protocol, spec)
 	if genErr != nil {
 		refunded := s.store.refund(user.ID, cost)
+		s.auditUser(r, user, "生图失败", spec.Model, fmt.Sprintf("扣的 %d 额度已退回：%s", cost, genErr.Error()))
 		var typed *httpError
 		if errors.As(genErr, &typed) {
 			typed.quota = &refunded
@@ -686,6 +811,16 @@ func (s *server) generateHandler(w http.ResponseWriter, r *http.Request) error {
 		return genErr
 	}
 	log.Printf("[generate] %s protocol=%s model=%s images=%d", result.Channel, protocol, spec.Model, len(result.Images))
+	// 带没带参考图和蒙版是要记的：局部重绘和整张重画，出来的东西不是一回事。
+	shape := "文生图"
+	if spec.Mode == "edit" {
+		shape = "图生图"
+		if spec.Mask != nil {
+			shape += "+蒙版"
+		}
+	}
+	s.auditUser(r, user, "生图", spec.Model,
+		fmt.Sprintf("%s，%s，%s，扣 %d 额度", shape, specSizeLabel(spec), result.Channel, cost))
 
 	// 落库，作品集和公开作品都靠它。存不下也不影响这次生成的结果。
 	if record, err := s.store.saveGeneration(GenerationInput{
@@ -831,6 +966,7 @@ func (s *server) generationDelete(w http.ResponseWriter, r *http.Request) error 
 	if err := s.store.deleteGeneration(r.PathValue("id"), user.ID); err != nil {
 		return err
 	}
+	s.auditUser(r, user, "删除作品", r.PathValue("id"), "")
 	writeJSON(w, 200, map[string]any{"ok": true})
 	return nil
 }
@@ -853,6 +989,11 @@ func (s *server) generationPatch(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	item.Mine = true
+	action := "取消公开"
+	if isPublic {
+		action = "公开作品"
+	}
+	s.auditUser(r, user, action, item.ID, item.Prompt)
 	writeJSON(w, 200, map[string]any{"ok": true, "item": item})
 	return nil
 }
@@ -918,16 +1059,14 @@ func buildSpec(ctx context.Context, body map[string]any, protocol string) (gener
 		return generateSpec{}, err
 	}
 	spec.File = file
-	imageURL := firstString(body["imageUrl"])
-	if mode == "edit" {
-		if spec.File != nil {
-			// 文件优先
-		} else if imageURL != "" {
-			if spec.ImageURL, err = assertPublicImageURL(imageURL); err != nil {
-				return generateSpec{}, err
-			}
-		} else {
+	if mode == "edit" && spec.File == nil {
+		// 传了文件就用文件，否则把网址取回来——取回来才知道是不是真图片。
+		imageURL := firstString(body["imageUrl"])
+		if imageURL == "" {
 			return generateSpec{}, fail(400, "图生图需要上传参考图，或填写 https 图片地址")
+		}
+		if spec.File, err = downloadReference(ctx, imageURL, "参考图", "reference"); err != nil {
+			return generateSpec{}, err
 		}
 	}
 
@@ -945,26 +1084,9 @@ func buildSpec(ctx context.Context, body map[string]any, protocol string) (gener
 		}
 		spec.Mask = mask
 		if mask == nil {
-			if spec.MaskURL, err = assertPublicImageURL(maskURL); err != nil {
+			if spec.Mask, err = downloadReference(ctx, maskURL, "蒙版", "mask"); err != nil {
 				return generateSpec{}, err
 			}
-		}
-		// 上游只有「两个文件」或「两个 URL」两种形状，混着来时把 URL 那一半下下来，
-		// 统一走 multipart，免得蒙版被静默丢掉。
-		if spec.Mask != nil && spec.ImageURL != "" {
-			downloaded, err := downloadReference(ctx, spec.ImageURL)
-			if err != nil {
-				return generateSpec{}, err
-			}
-			spec.File = downloaded
-			spec.ImageURL = ""
-		} else if spec.MaskURL != "" && spec.File != nil {
-			downloaded, err := downloadReference(ctx, spec.MaskURL)
-			if err != nil {
-				return generateSpec{}, err
-			}
-			spec.Mask = downloaded
-			spec.MaskURL = ""
 		}
 	}
 
@@ -1032,6 +1154,8 @@ func (s *server) batchSubmit(w http.ResponseWriter, r *http.Request) error {
 	if submitErr != nil {
 		// 任务没送到上游，额度退回去。
 		refunded := s.store.refund(user.ID, cost)
+		s.auditUser(r, user, "批量生图失败", firstString(body["model"]),
+			fmt.Sprintf("%d 条，扣的 %d 额度已退回：%s", outputs, cost, submitErr.Error()))
 		var typed *httpError
 		if errors.As(submitErr, &typed) {
 			typed.quota = &refunded
@@ -1039,6 +1163,8 @@ func (s *server) batchSubmit(w http.ResponseWriter, r *http.Request) error {
 		}
 		return submitErr
 	}
+	s.auditUser(r, user, "批量生图", firstString(body["model"]),
+		fmt.Sprintf("%d 条，扣 %d 额度", outputs, cost))
 	writeJSON(w, 200, map[string]any{"ok": true, "result": result, "cost": cost, "outputs": outputs, "quota": quota})
 	return nil
 }
@@ -1083,7 +1209,7 @@ func parseBatchBody(body map[string]any) (map[string]any, int, error) {
 			}
 			urls := []any{}
 			for _, ref := range refs {
-				checked, err := assertPublicImageURL(firstString(ref))
+				checked, err := assertPublicImageURL(firstString(ref), "参考图")
 				if err != nil {
 					return nil, 0, err
 				}
@@ -1289,19 +1415,44 @@ func (s *server) adminLogin(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	token, err := s.store.loginAdmin(firstString(body["username"]), firstString(body["password"]))
+	username := firstString(body["username"])
+	token, err := s.store.loginAdmin(username, firstString(body["password"]))
 	if err != nil {
+		s.audit(r, AuditEntry{ActorKind: "admin", ActorName: username, Action: "管理端登录失败", Target: username, Detail: err.Error()})
 		return err
 	}
+	s.auditAdmin(r, "管理端登录", username, "")
 	writeJSON(w, 200, map[string]any{"ok": true}, sessionCookie(adminCookieName, token))
 	return nil
 }
 
 func (s *server) adminLogout(w http.ResponseWriter, r *http.Request) error {
+	// 先认人再踢会话，跟用户端登出一个道理。
+	name := s.store.adminName()
 	if err := s.store.logout(cookieValue(r, adminCookieName)); err != nil {
 		return err
 	}
+	s.audit(r, AuditEntry{ActorKind: "admin", ActorName: name, Action: "管理端登出"})
 	writeJSON(w, 200, map[string]any{"ok": true}, sessionCookie(adminCookieName, ""))
+	return nil
+}
+
+// adminAudit 翻审计日志。action 传空就是全部，传了就只看那一种。
+func (s *server) adminAudit(w http.ResponseWriter, r *http.Request) error {
+	if err := s.requireAdmin(r); err != nil {
+		return err
+	}
+	limit, offset := pageParams(r)
+	action := strings.TrimSpace(r.URL.Query().Get("action"))
+	items, total, err := s.store.auditLogs(action, limit, offset)
+	if err != nil {
+		return err
+	}
+	actions, err := s.store.auditActions()
+	if err != nil {
+		return err
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "items": items, "total": total, "actions": actions})
 	return nil
 }
 
@@ -1347,6 +1498,8 @@ func (s *server) adminSettings(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	s.auditAdmin(r, "改签到规则", "",
+		fmt.Sprintf("签到 %d–%d，每次生图扣 %d", settings.CheckinMin, settings.CheckinMax, settings.GenerateCost))
 	writeJSON(w, 200, map[string]any{"ok": true, "settings": settings})
 	return nil
 }
@@ -1362,6 +1515,7 @@ func (s *server) adminPassword(w http.ResponseWriter, r *http.Request) error {
 	if err := s.store.changeAdminPassword(firstString(body["oldPassword"]), firstString(body["newPassword"])); err != nil {
 		return err
 	}
+	s.auditAdmin(r, "改管理密码", "", "")
 	writeJSON(w, 200, map[string]any{"ok": true})
 	return nil
 }
@@ -1415,6 +1569,7 @@ func (s *server) adminSaveKey(w http.ResponseWriter, r *http.Request) error {
 		ID:        firstString(body["id"]),
 		Name:      firstString(body["name"]),
 		Protocol:  protocol,
+		ModelType: strings.TrimSpace(firstString(body["modelType"])),
 		BaseURL:   baseURL,
 		APIKey:    apiKey,
 		UserAgent: truncate(strings.TrimSpace(firstString(body["userAgent"])), 200),
@@ -1425,8 +1580,22 @@ func (s *server) adminSaveKey(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	// Key 的密钥不进审计：审计是给人翻的，不该变成第二个泄露面。
+	action := "新增 Key"
+	if firstString(body["id"]) != "" {
+		action = "改 Key"
+	}
+	s.auditAdmin(r, action, key.Name,
+		fmt.Sprintf("%s · %s · %s · %s", key.Protocol, modelTypeLabel(key.ModelType), key.BaseURL, enabledText(key.Enabled)))
 	writeJSON(w, 200, map[string]any{"ok": true, "key": key})
 	return nil
+}
+
+func enabledText(enabled bool) string {
+	if enabled {
+		return "启用"
+	}
+	return "停用"
 }
 
 func orDefault(value, fallback string) string {
@@ -1440,35 +1609,63 @@ func (s *server) adminDeleteKey(w http.ResponseWriter, r *http.Request) error {
 	if err := s.requireAdmin(r); err != nil {
 		return err
 	}
+	// 删之前先把名字记下来，删完就查不到了。
+	name := r.PathValue("id")
+	if key, err := s.store.keyByID(r.PathValue("id")); err == nil {
+		name = key.Name
+	}
 	if err := s.store.deleteKey(r.PathValue("id")); err != nil {
 		return err
 	}
+	s.auditAdmin(r, "删除 Key", name, "")
 	writeJSON(w, 200, map[string]any{"ok": true})
 	return nil
 }
 
-func (s *server) adminRefreshBalance(w http.ResponseWriter, r *http.Request) error {
-	if err := s.requireAdmin(r); err != nil {
-		return err
-	}
-	id := r.PathValue("id")
-	key, err := s.store.keyByID(id)
-	if err != nil {
-		return fail(404, "找不到这把 Key")
-	}
-	fresh, err := fetchKeyBalance(r.Context(), key)
+// refreshBalanceOf 问中转站这把 Key 还剩多少钱并记下来。失败只记错误，
+// 不清掉上次那个数——查询失败不代表钱变了，清掉反而让人以为余额归零了。
+func (s *server) refreshBalanceOf(ctx context.Context, key Key) (Key, error) {
+	fresh, err := fetchKeyBalance(ctx, key)
 	if err != nil {
 		message := "刷新余额失败"
 		var typed *httpError
 		if errors.As(err, &typed) {
 			message = typed.msg
 		}
-		if _, saveErr := s.store.setKeyBalance(id, nil, "", nil, message); saveErr != nil {
+		if _, saveErr := s.store.setKeyBalance(key.ID, nil, "", nil, message); saveErr != nil {
 			log.Printf("记录余额错误失败：%v", saveErr)
 		}
+		return Key{}, err
+	}
+	return s.store.setKeyBalance(key.ID, &fresh.Amount, fresh.Unit, fresh.Valid, "")
+}
+
+// refreshModelsOf 问中转站这把 Key 能用哪些模型，记下来给用户端的模型下拉用。
+func (s *server) refreshModelsOf(ctx context.Context, key Key) (Key, error) {
+	models, err := fetchKeyModels(ctx, key)
+	if err != nil {
+		message := "拉取模型失败"
+		var typed *httpError
+		if errors.As(err, &typed) {
+			message = typed.msg
+		}
+		if _, saveErr := s.store.setKeyModels(key.ID, nil, message); saveErr != nil {
+			log.Printf("记录模型错误失败：%v", saveErr)
+		}
+		return Key{}, err
+	}
+	return s.store.setKeyModels(key.ID, models, "")
+}
+
+func (s *server) adminRefreshBalance(w http.ResponseWriter, r *http.Request) error {
+	if err := s.requireAdmin(r); err != nil {
 		return err
 	}
-	updated, err := s.store.setKeyBalance(id, &fresh.Amount, fresh.Unit, fresh.Valid, "")
+	key, err := s.store.keyByID(r.PathValue("id"))
+	if err != nil {
+		return fail(404, "找不到这把 Key")
+	}
+	updated, err := s.refreshBalanceOf(r.Context(), key)
 	if err != nil {
 		return err
 	}
@@ -1481,24 +1678,11 @@ func (s *server) adminRefreshModels(w http.ResponseWriter, r *http.Request) erro
 	if err := s.requireAdmin(r); err != nil {
 		return err
 	}
-	id := r.PathValue("id")
-	key, err := s.store.keyByID(id)
+	key, err := s.store.keyByID(r.PathValue("id"))
 	if err != nil {
 		return fail(404, "找不到这把 Key")
 	}
-	models, err := fetchKeyModels(r.Context(), key)
-	if err != nil {
-		message := "拉取模型失败"
-		var typed *httpError
-		if errors.As(err, &typed) {
-			message = typed.msg
-		}
-		if _, saveErr := s.store.setKeyModels(id, nil, message); saveErr != nil {
-			log.Printf("记录模型错误失败：%v", saveErr)
-		}
-		return err
-	}
-	updated, err := s.store.setKeyModels(id, models, "")
+	updated, err := s.refreshModelsOf(r.Context(), key)
 	if err != nil {
 		return err
 	}
@@ -1534,15 +1718,30 @@ func (s *server) generationTypes(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	rates, err := s.store.modelRates()
+	if err != nil {
+		return err
+	}
+	settings, err := s.store.settings()
+	if err != nil {
+		return err
+	}
 
 	out := []map[string]any{}
 	for _, item := range types {
 		usable, total, supports, known := 0, 0, 0, 0
+		// 这个类型下面各把 Key 拉到的模型并集，给用户端手动选模型用。
+		choices := map[string]string{}
 		for _, key := range keys {
 			if key.ModelType != item.Type || key.APIKey == "" {
 				continue
 			}
 			total++
+			for _, model := range key.Models {
+				if _, exists := choices[model.ID]; !exists {
+					choices[model.ID] = model.Name
+				}
+			}
 			if !key.Enabled {
 				continue
 			}
@@ -1565,6 +1764,27 @@ func (s *server) generationTypes(w http.ResponseWriter, r *http.Request) error {
 		if total == 0 {
 			continue
 		}
+		// 每个模型带上自己的倍率，用户端好算出这次到底扣多少——
+		// 倍率是「类型 × 模型」两层相乘，只给类型那一层算不对。
+		models := make([]map[string]any, 0, len(choices))
+		for id, name := range choices {
+			if name == "" {
+				name = id
+			}
+			rate := rates[id]
+			if rate <= 0 {
+				rate = 1
+			}
+			models = append(models, map[string]any{
+				"id": id, "name": name,
+				"multiplier": rate,
+				"cost":       int(math.Ceil(float64(settings.GenerateCost) * item.Multiplier * rate)),
+			})
+		}
+		sort.Slice(models, func(i, j int) bool {
+			return models[i]["id"].(string) < models[j]["id"].(string)
+		})
+
 		out = append(out, map[string]any{
 			"type":         item.Type,
 			"label":        item.Label,
@@ -1573,9 +1793,31 @@ func (s *server) generationTypes(w http.ResponseWriter, r *http.Request) error {
 			"keys":         total,
 			"usable":       usable > 0,
 			"modelKnown":   known > 0 && supports > 0,
+			"models":       models,
 		})
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "types": out})
+	return nil
+}
+
+func (s *server) adminSaveModelRate(w http.ResponseWriter, r *http.Request) error {
+	if err := s.requireAdmin(r); err != nil {
+		return err
+	}
+	body, err := readJSON(w, r)
+	if err != nil {
+		return err
+	}
+	multiplier, ok := firstNumber(body["multiplier"])
+	if !ok {
+		return fail(400, "倍率请填数字")
+	}
+	rates, err := s.store.saveModelRate(r.PathValue("id"), multiplier)
+	if err != nil {
+		return err
+	}
+	s.auditAdmin(r, "改模型倍率", r.PathValue("id"), fmt.Sprintf("%v 倍", multiplier))
+	writeJSON(w, 200, map[string]any{"ok": true, "modelRates": rates})
 	return nil
 }
 
@@ -1595,6 +1837,8 @@ func (s *server) adminSaveType(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	s.auditAdmin(r, "改生图类型", modelTypeLabel(item.Type),
+		fmt.Sprintf("默认模型 %s，%v 倍", item.DefaultModel, item.Multiplier))
 	writeJSON(w, 200, map[string]any{"ok": true, "modelType": item})
 	return nil
 }
@@ -1610,6 +1854,7 @@ func (s *server) adminPatchUser(w http.ResponseWriter, r *http.Request) error {
 	id := r.PathValue("id")
 	var user User
 	changed := false
+	notes := []string{}
 	if raw, exists := body["quota"]; exists {
 		value, ok := firstNumber(raw)
 		if !ok || value != float64(int(value)) {
@@ -1619,6 +1864,7 @@ func (s *server) adminPatchUser(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
+		notes = append(notes, fmt.Sprintf("额度改成 %d", int(value)))
 		changed = true
 	}
 	if raw, exists := body["disabled"]; exists {
@@ -1630,11 +1876,13 @@ func (s *server) adminPatchUser(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
+		notes = append(notes, map[bool]string{true: "停用", false: "启用"}[disabled])
 		changed = true
 	}
 	if !changed {
 		return fail(400, "没有要修改的字段")
 	}
+	s.auditAdmin(r, "改用户", user.Username, strings.Join(notes, "，"))
 	writeJSON(w, 200, map[string]any{"ok": true, "user": user})
 	return nil
 }
@@ -1651,6 +1899,7 @@ func (s *server) adminResetUserPassword(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		return err
 	}
+	s.auditAdmin(r, "重置用户密码", user.Username, "该用户已登录的会话都被踢掉")
 	writeJSON(w, 200, map[string]any{"ok": true, "user": user})
 	return nil
 }
@@ -1659,9 +1908,15 @@ func (s *server) adminDeleteUser(w http.ResponseWriter, r *http.Request) error {
 	if err := s.requireAdmin(r); err != nil {
 		return err
 	}
+	// 删之前先记下是谁，删完就查不到了。
+	name := r.PathValue("id")
+	if user, err := s.store.userByID(r.PathValue("id")); err == nil {
+		name = user.Username
+	}
 	if err := s.store.deleteUser(r.PathValue("id")); err != nil {
 		return err
 	}
+	s.auditAdmin(r, "删除用户", name, "作品和签到记录一并删除")
 	writeJSON(w, 200, map[string]any{"ok": true})
 	return nil
 }

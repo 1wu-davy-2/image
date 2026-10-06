@@ -1,7 +1,9 @@
 package main
 
 import (
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -25,7 +27,7 @@ func TestReserveForTypeAppliesMultiplier(t *testing.T) {
 		t.Fatalf("配类型失败：%v", err)
 	}
 
-	key, item, cost, quota, err := store.reserveForType(user.ID, "gpt", 1)
+	key, item, cost, quota, err := store.reserveForType(user.ID, "gpt", "", 1)
 	if err != nil {
 		t.Fatalf("扣额度失败：%v", err)
 	}
@@ -50,7 +52,7 @@ func TestReserveForTypeOnlyUsesItsOwnType(t *testing.T) {
 	user := newTestUser(t, store, "buyer")
 	recharge(t, store, user.ID, 100)
 
-	if _, _, _, _, err := store.reserveForType(user.ID, "gpt", 1); err == nil {
+	if _, _, _, _, err := store.reserveForType(user.ID, "gpt", "", 1); err == nil {
 		t.Fatal("gpt 类型下面没挂 Key，该报错")
 	}
 	// 挑不到 Key 就不能扣钱。
@@ -83,6 +85,34 @@ func TestPickKeyForTypePrefersKeyThatHasTheModel(t *testing.T) {
 	}
 	if key.ID != poor.ID {
 		t.Fatalf("该挑有 gpt-image-2.5 的那把（余额小的），实际挑了 %q", key.Name)
+	}
+}
+
+// 用户手动选了个别的模型，挑 Key 要按那个模型找，不是按默认模型找——
+// 不然会挑到一把没有这个模型的 Key，白挑。
+func TestPickKeyForTypeUsesTheChosenModel(t *testing.T) {
+	store := newTestStore(t)
+	yes := true
+	defaultOnly := seedKey(t, store, "default-only", "gpt", floatPtr(100), &yes, true)
+	otherOnly := seedKey(t, store, "other-only", "gpt", floatPtr(1), &yes, true)
+	if _, err := store.setKeyModels(defaultOnly.ID, []ModelInfo{{ID: "gpt-image-2.5"}}, ""); err != nil {
+		t.Fatalf("写模型失败：%v", err)
+	}
+	if _, err := store.setKeyModels(otherOnly.ID, []ModelInfo{{ID: "gpt-image-2.5-flare"}}, ""); err != nil {
+		t.Fatalf("写模型失败：%v", err)
+	}
+	if _, err := store.saveModelType("gpt", "gpt-image-2.5", 1); err != nil {
+		t.Fatalf("配类型失败：%v", err)
+	}
+	user := newTestUser(t, store, "buyer")
+	recharge(t, store, user.ID, 100)
+
+	key, _, _, _, err := store.reserveForType(user.ID, "gpt", "gpt-image-2.5-flare", 1)
+	if err != nil {
+		t.Fatalf("扣额度失败：%v", err)
+	}
+	if key.ID != otherOnly.ID {
+		t.Fatalf("该挑有 gpt-image-2.5-flare 的那把，实际挑了 %q", key.Name)
 	}
 }
 
@@ -215,6 +245,114 @@ func TestSaveKeyGuessesModelTypeWhenMissing(t *testing.T) {
 	}
 }
 
+// 倍率是两层相乘：类型 × 模型。模型没设过就是 1.0，等于不加价。
+func TestReserveForTypeMultipliesTypeAndModelRates(t *testing.T) {
+	store := newTestStore(t)
+	yes := true
+	seedKey(t, store, "gpt-key", "gpt", floatPtr(10), &yes, true)
+	user := newTestUser(t, store, "buyer")
+	recharge(t, store, user.ID, 100)
+
+	if _, err := store.saveModelType("gpt", "gpt-image-2.5", 1.5); err != nil {
+		t.Fatalf("配类型失败：%v", err)
+	}
+	if _, err := store.saveModelRate("gpt-image-2.5", 2); err != nil {
+		t.Fatalf("配模型倍率失败：%v", err)
+	}
+
+	// 1 额度 × 1.5（类型）× 2（模型）= 3
+	_, _, cost, _, err := store.reserveForType(user.ID, "gpt", "", 1)
+	if err != nil {
+		t.Fatalf("扣额度失败：%v", err)
+	}
+	if cost != 3 {
+		t.Fatalf("1 × 1.5 × 2 该是 3，实际 %d", cost)
+	}
+}
+
+// 没设过倍率的模型按 1.0 算，类型那一层照旧生效。
+func TestUnsetModelRateIsOne(t *testing.T) {
+	store := newTestStore(t)
+	if rate, err := store.modelMultiplier("没设过的模型"); err != nil || rate != 1 {
+		t.Fatalf("没设过该是 1.0，实际 %v（err=%v）", rate, err)
+	}
+	if rate, err := store.modelMultiplier(""); err != nil || rate != 1 {
+		t.Fatalf("空模型名该是 1.0，实际 %v（err=%v）", rate, err)
+	}
+
+	yes := true
+	seedKey(t, store, "gpt-key", "gpt", floatPtr(10), &yes, true)
+	user := newTestUser(t, store, "buyer")
+	recharge(t, store, user.ID, 100)
+	if _, err := store.saveModelType("gpt", "gpt-image-2.5", 1.5); err != nil {
+		t.Fatalf("配类型失败：%v", err)
+	}
+	// 1 额度 × 1.5（类型）× 1.0（模型没设）= 1.5，向上取整 2
+	_, _, cost, _, err := store.reserveForType(user.ID, "gpt", "", 1)
+	if err != nil {
+		t.Fatalf("扣额度失败：%v", err)
+	}
+	if cost != 2 {
+		t.Fatalf("模型没设倍率时该只按类型算，1 × 1.5 取整成 2，实际 %d", cost)
+	}
+}
+
+func TestSaveModelRateValidates(t *testing.T) {
+	store := newTestStore(t)
+	if _, err := store.saveModelRate("gpt-image-2.5", 0); err == nil {
+		t.Fatal("倍率 0 该被拒绝")
+	}
+	if _, err := store.saveModelRate("gpt-image-2.5", 1000); err == nil {
+		t.Fatal("倍率 1000 该被拒绝")
+	}
+	if _, err := store.saveModelRate("带中文的模型名", 1); err == nil {
+		t.Fatal("模型名不合法该被拒绝")
+	}
+
+	// 存两次是改，不是插两条。
+	if _, err := store.saveModelRate("gpt-image-2.5", 1.5); err != nil {
+		t.Fatalf("保存失败：%v", err)
+	}
+	rates, err := store.saveModelRate("gpt-image-2.5", 3)
+	if err != nil {
+		t.Fatalf("改倍率失败：%v", err)
+	}
+	if len(rates) != 1 || rates["gpt-image-2.5"] != 3 {
+		t.Fatalf("同一个模型该只有一条记录，实际 %+v", rates)
+	}
+}
+
+// 管理端表单里选的那个类型得真的存下去。store.saveKey 是收这个字段的，
+// 但 HTTP 那层忘了往下传的话，表单上选的类型会被静默换成按调用方式猜的那个。
+func TestAdminSaveKeyKeepsModelType(t *testing.T) {
+	store := newTestStore(t)
+	token, err := store.createSession("admin", "")
+	if err != nil {
+		t.Fatalf("发管理端会话失败：%v", err)
+	}
+	body := `{"name":"新号","protocol":"gpt","modelType":"grok",` +
+		`"baseUrl":"https://uuapi.io/v1","apiKey":"sk-abcdefgh","enabled":true}`
+	srv := &server{store: store}
+	req := httptest.NewRequest("POST", "/api/admin/keys", strings.NewReader(body))
+	req.AddCookie(&http.Cookie{Name: adminCookieName, Value: token})
+	rec := httptest.NewRecorder()
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("该回 200，实际 %d：%s", rec.Code, rec.Body.String())
+	}
+
+	keys, err := store.keys()
+	if err != nil {
+		t.Fatalf("读 Key 失败：%v", err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("该存下 1 把，实际 %d 把", len(keys))
+	}
+	if keys[0].ModelType != "grok" {
+		t.Fatalf("表单选的 grok 该原样存下去，实际 %q（多半是没往下传，被猜成别的了）", keys[0].ModelType)
+	}
+}
+
 // 用户端只该看到挂了 Key 的类型，还得知道那个类型下面有没有这个默认模型。
 func TestGenerationTypesEndpoint(t *testing.T) {
 	store := newTestStore(t)
@@ -248,6 +386,35 @@ func TestGenerationTypesEndpoint(t *testing.T) {
 	}
 	if first["usable"] != true || first["modelKnown"] != true {
 		t.Fatalf("Key 有余额、模型列表里也有这个模型，该标成可用：%+v", first)
+	}
+
+	// 每个模型要带上自己的倍率和算好的费用：倍率是「类型 × 模型」两层，
+	// 只给类型那一层，用户端算不对这次扣多少。
+	models, _ := first["models"].([]any)
+	if len(models) != 1 {
+		t.Fatalf("该带 1 个模型，实际 %+v", models)
+	}
+	entry, _ := models[0].(map[string]any)
+	if entry["id"] != "gpt-image-2.5" {
+		t.Fatalf("模型 id 不对：%+v", entry)
+	}
+	// 每次消耗 1 × 类型 1.5 × 模型没设（1.0）= 1.5，向上取整 2
+	if entry["cost"] != float64(2) || entry["multiplier"] != float64(1) {
+		t.Fatalf("没设模型倍率时该按类型算成 2，实际 %+v", entry)
+	}
+
+	// 给模型设个倍率，费用要跟着涨。
+	if _, err := store.saveModelRate("gpt-image-2.5", 3); err != nil {
+		t.Fatalf("配模型倍率失败：%v", err)
+	}
+	payload = getJSON(t, store, "/api/types", token)
+	types, _ = payload["types"].([]any)
+	first, _ = types[0].(map[string]any)
+	models, _ = first["models"].([]any)
+	entry, _ = models[0].(map[string]any)
+	// 1 × 1.5 × 3 = 4.5，向上取整 5
+	if entry["multiplier"] != float64(3) || entry["cost"] != float64(5) {
+		t.Fatalf("1 × 1.5 × 3 该算成 5，实际 %+v", entry)
 	}
 
 	// 默认模型不在 Key 的模型列表里时要标出来，用户端才能提示。

@@ -185,6 +185,16 @@ func (r upstreamResponse) payload() map[string]any {
 }
 
 func callUpstream(ctx context.Context, method, target string, headers map[string]string, body io.Reader) (upstreamResponse, error) {
+	return callUpstreamLimit(ctx, method, target, headers, body, 0)
+}
+
+// errTooBig 表示正文超过了 limit。调用方自己决定怎么跟用户说。
+var errTooBig = errors.New("响应体超过上限")
+
+// callUpstreamLimit 比 callUpstream 多一个正文上限。用户给的图片地址可能指向一个
+// 几 G 的文件，读完了再判大小就晚了——所以边读边掐，超了就停。
+// limit 为 0 表示不限。
+func callUpstreamLimit(ctx context.Context, method, target string, headers map[string]string, body io.Reader, limit int64) (upstreamResponse, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, upstreamTimeout)
 	defer cancel()
 
@@ -203,9 +213,16 @@ func callUpstream(ctx context.Context, method, target string, headers map[string
 		return upstreamResponse{}, fail(502, "连接中转站失败")
 	}
 	defer res.Body.Close()
-	raw, err := io.ReadAll(res.Body)
+	reader := io.Reader(res.Body)
+	if limit > 0 {
+		reader = io.LimitReader(res.Body, limit+1)
+	}
+	raw, err := io.ReadAll(reader)
 	if err != nil {
 		return upstreamResponse{}, fail(502, "读取上游响应失败")
+	}
+	if limit > 0 && int64(len(raw)) > limit {
+		return upstreamResponse{Status: res.StatusCode, Header: res.Header}, errTooBig
 	}
 	return upstreamResponse{Status: res.StatusCode, Header: res.Header, Body: raw}, nil
 }
@@ -716,6 +733,9 @@ func taskIDOf(payload map[string]any, res upstreamResponse) string {
 	return decoded
 }
 
+// 参考图和蒙版一律是「已经拿到手的文件」：用户给网址的话，buildSpec 会先替上游取回来。
+// 所以这里没有 ImageURL / MaskURL——上游不用自己取图，热链、防盗链、签名短链过期
+// 这些坑就都跟这次请求无关了。
 type generateSpec struct {
 	Model       string
 	Prompt      string
@@ -725,9 +745,7 @@ type generateSpec struct {
 	AspectRatio string
 	ImageSize   string
 	File        *imageFile
-	ImageURL    string
 	Mask        *imageFile
-	MaskURL     string
 }
 
 func generate(ctx context.Context, cred credential, protocol string, spec generateSpec) (generateResult, error) {
@@ -760,13 +778,6 @@ func generateOpenAI(ctx context.Context, base string, cred credential, spec gene
 	if spec.Quality != "" {
 		payload["quality"] = spec.Quality
 	}
-	if spec.Mode == "edit" && spec.ImageURL != "" {
-		payload["images"] = []any{map[string]any{"image_url": spec.ImageURL}}
-	}
-	if spec.Mode == "edit" && spec.MaskURL != "" {
-		payload["mask"] = map[string]any{"image_url": spec.MaskURL}
-	}
-
 	asyncPath, syncPath := "/images/generations/async", "/images/generations"
 	if spec.Mode == "edit" {
 		asyncPath, syncPath = "/images/edits/async", "/images/edits"
@@ -785,6 +796,12 @@ func generateOpenAI(ctx context.Context, base string, cred credential, spec gene
 
 	if fallback == "chat" && chatFallbackStatuses[queued.Status] {
 		imagesError := errorMessage(queued.payload(), queued.Status)
+		// 对话接口只收文字和参考图，带不了蒙版。这时候退过去，用户会拿到一张
+		// 整张重画的图，还以为局部重绘生效了——不如当场说清楚。
+		if spec.Mask != nil {
+			return generateResult{}, fail(400, "这把 Key 的生图接口不收这次请求（"+imagesError+
+				"），而对话接口带不了蒙版。去掉蒙版再试，或换一把支持生图接口的 Key。")
+		}
 		result, chatErr := generateViaChat(ctx, base, cred, spec)
 		if chatErr == nil {
 			return result, nil
@@ -857,8 +874,6 @@ func generateViaChat(ctx context.Context, base string, cred credential, spec gen
 			"type":      "image_url",
 			"image_url": map[string]any{"url": "data:" + spec.File.Mime + ";base64," + encoded},
 		})
-	} else if spec.ImageURL != "" {
-		content = append(content, map[string]any{"type": "image_url", "image_url": map[string]any{"url": spec.ImageURL}})
 	}
 	message := map[string]any{"role": "user", "content": spec.Prompt}
 	if len(content) > 1 {
@@ -897,15 +912,6 @@ func generateOfficial(ctx context.Context, cred credential, spec generateSpec) (
 		parts = append(parts, map[string]any{"inlineData": map[string]any{
 			"mimeType": spec.File.Mime,
 			"data":     base64.StdEncoding.EncodeToString(spec.File.Buffer),
-		}})
-	} else if spec.ImageURL != "" {
-		downloaded, err := downloadReference(ctx, spec.ImageURL)
-		if err != nil {
-			return generateResult{}, err
-		}
-		parts = append(parts, map[string]any{"inlineData": map[string]any{
-			"mimeType": downloaded.Mime,
-			"data":     base64.StdEncoding.EncodeToString(downloaded.Buffer),
 		}})
 	}
 	parts = append(parts, map[string]any{"text": spec.Prompt})
@@ -993,26 +999,44 @@ func pollTask(ctx context.Context, base string, cred credential, taskID string) 
 
 /* ---------- 参考图 ---------- */
 
-func assertPublicImageURL(raw string) (string, error) {
+// assertPublicImageURL 只管地址这一层：https、公网、不是本机。图到底取不取得到、
+// 是不是真图片，得真发一次请求才知道，那在 downloadReference 里。
+// label 是给用户看的名字（参考图 / 蒙版 / 图片），报错要指名道姓，
+// 不然蒙版下载失败却提示「参考图」，用户会去改错的地方。
+func assertPublicImageURL(raw, label string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Host == "" {
-		return "", fail(400, "参考图 URL 不合法")
+		return "", fail(400, label+" URL 不合法")
 	}
 	if parsed.Scheme != "https" {
-		return "", fail(400, "参考图 URL 只允许 https")
+		return "", fail(400, label+" URL 只允许 https")
 	}
 	host := strings.ToLower(parsed.Hostname())
 	if host == "localhost" || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
-		return "", fail(400, "参考图 URL 不能指向本机")
+		return "", fail(400, label+" URL 不能指向本机")
 	}
 	if regexp.MustCompile(`^(127\.|10\.|192\.168\.|0\.0\.0\.0|169\.254\.)`).MatchString(host) ||
 		regexp.MustCompile(`^172\.(1[6-9]|2\d|3[0-1])\.`).MatchString(host) {
-		return "", fail(400, "参考图 URL 不能指向内网")
+		return "", fail(400, label+" URL 不能指向内网")
 	}
 	return parsed.String(), nil
 }
 
 var allowedImageMimes = map[string]bool{"image/png": true, "image/jpeg": true, "image/webp": true}
+
+// sniffImageMime 认字节，不认响应头。对象存储经常把真图的 content-type 标成
+// application/octet-stream，只看头会把好好的图拒掉。认不出来就返回空。
+func sniffImageMime(data []byte) string {
+	switch {
+	case bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")):
+		return "image/png"
+	case bytes.HasPrefix(data, []byte{0xFF, 0xD8, 0xFF}):
+		return "image/jpeg"
+	case len(data) >= 12 && bytes.HasPrefix(data, []byte("RIFF")) && string(data[8:12]) == "WEBP":
+		return "image/webp"
+	}
+	return ""
+}
 
 func decodeImage(mime, data, name, label string) (*imageFile, error) {
 	if !allowedImageMimes[mime] {
@@ -1036,56 +1060,83 @@ func decodeImage(mime, data, name, label string) (*imageFile, error) {
 	return &imageFile{Mime: mime, Buffer: buffer, Name: truncate(safe, 80)}, nil
 }
 
-func downloadReference(ctx context.Context, raw string) (*imageFile, error) {
-	current, err := assertPublicImageURL(raw)
+// downloadReference 把参考图 / 蒙版取回来，顺手验一遍再交给上游。
+// 上游自己取图失败时只会丢一句很难懂的错，所以在这里先替它取：
+// 状态码、字节大小、真字节的魔数，都过一遍，错也要错得说得清。
+// label 是给用户看的名字，name 是发给上游的文件名（ASCII，免得 multipart 头里出中文）。
+func downloadReference(ctx context.Context, raw, label, name string) (*imageFile, error) {
+	current, err := assertPublicImageURL(raw, label)
 	if err != nil {
 		return nil, err
 	}
 	for hop := 0; hop < 3; hop++ {
-		res, err := callUpstream(ctx, http.MethodGet, current, map[string]string{"User-Agent": defaultUserAgent}, nil)
+		res, err := callUpstreamLimit(ctx, http.MethodGet, current, map[string]string{"User-Agent": defaultUserAgent}, nil, imageLimit)
+		if errors.Is(err, errTooBig) {
+			return nil, fail(400, fmt.Sprintf("%s需小于 %dMB", label, imageLimit/1024/1024))
+		}
 		if err != nil {
 			return nil, err
 		}
 		if res.Status >= 300 && res.Status < 400 {
 			location := res.Header.Get("Location")
 			if location == "" {
-				return nil, fail(400, "参考图下载失败")
+				return nil, fail(400, label+"下载失败：对方返回了跳转却没给地址")
 			}
 			base, _ := url.Parse(current)
 			next, _ := url.Parse(location)
-			current, err = assertPublicImageURL(base.ResolveReference(next).String())
+			current, err = assertPublicImageURL(base.ResolveReference(next).String(), label)
 			if err != nil {
 				return nil, err
 			}
 			continue
 		}
 		if res.Status < 200 || res.Status >= 300 {
-			return nil, fail(400, "参考图下载失败")
+			return nil, fail(400, fmt.Sprintf("%s取不到：对方返回 HTTP %d", label, res.Status))
 		}
-		mime := strings.ToLower(strings.TrimSpace(strings.Split(res.Header.Get("Content-Type"), ";")[0]))
-		if !allowedImageMimes[mime] {
-			return nil, fail(400, "参考图只支持 PNG、JPEG、WebP")
+		if len(res.Body) == 0 {
+			return nil, fail(400, label+"是空的")
 		}
-		if len(res.Body) == 0 || len(res.Body) > imageLimit {
-			return nil, fail(400, fmt.Sprintf("参考图需小于 %dMB", imageLimit/1024/1024))
+		if len(res.Body) > imageLimit {
+			return nil, fail(400, fmt.Sprintf("%s需小于 %dMB", label, imageLimit/1024/1024))
 		}
-		return &imageFile{Mime: mime, Buffer: res.Body, Name: "reference"}, nil
+		mime := sniffImageMime(res.Body)
+		if mime == "" {
+			// 最常见的坑：用户复制的是网页地址，不是图片地址。
+			return nil, fail(400, fmt.Sprintf("%s不是图片（对方返回 %s），要图片直链", label, describeBody(res)))
+		}
+		return &imageFile{
+			Mime:   mime,
+			Buffer: res.Body,
+			Name:   name + "." + strings.TrimPrefix(mime, "image/"),
+		}, nil
 	}
-	return nil, fail(400, "参考图重定向过多")
+	return nil, fail(400, label+"跳转次数太多")
+}
+
+// describeBody 把「对方到底给了什么」写进报错里，用户好判断是复制错地址了还是图床抽风。
+func describeBody(res upstreamResponse) string {
+	kind := strings.ToLower(strings.TrimSpace(strings.Split(res.Header.Get("Content-Type"), ";")[0]))
+	if kind == "" {
+		kind = "没标类型"
+	}
+	if kind == "text/html" {
+		return kind + "，像是网页不是图"
+	}
+	return kind
 }
 
 // fetchGeneratedImage 把上游给的成品图拉回来存进库，省得链接过期后作品集只剩空框。
 // 拉不动（含地址不是公网、超限、上游 4xx）就返回空，调用方退回直接用原链接。
 func fetchGeneratedImage(ctx context.Context, rawURL string) ([]byte, string) {
-	target, err := assertPublicImageURL(rawURL)
+	target, err := assertPublicImageURL(rawURL, "图片")
 	if err != nil {
 		return nil, ""
 	}
-	res, err := callUpstream(ctx, http.MethodGet, target, map[string]string{"User-Agent": defaultUserAgent}, nil)
+	res, err := callUpstreamLimit(ctx, http.MethodGet, target, map[string]string{"User-Agent": defaultUserAgent}, nil, imageLimit)
 	if err != nil || res.Status < 200 || res.Status >= 300 {
 		return nil, ""
 	}
-	if len(res.Body) == 0 || len(res.Body) > imageLimit {
+	if len(res.Body) == 0 {
 		return nil, ""
 	}
 	mime := strings.ToLower(strings.TrimSpace(strings.Split(res.Header.Get("Content-Type"), ";")[0]))

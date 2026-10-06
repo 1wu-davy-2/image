@@ -77,8 +77,8 @@ func TestGallerySaveAndRead(t *testing.T) {
 	if item.Images[0].Position != 0 || item.Images[1].Position != 1 {
 		t.Fatalf("图片序号不对：%+v", item.Images)
 	}
-	if item.IsPublic {
-		t.Fatal("新作品默认不该是公开的")
+	if !item.IsPublic {
+		t.Fatal("新作品默认就该是公开的")
 	}
 	if item.Username != "alice" {
 		t.Fatalf("用户名应为 alice，实际 %q", item.Username)
@@ -122,25 +122,25 @@ func TestGalleryVisibility(t *testing.T) {
 		t.Fatalf("alice 应该只看到自己那条：total=%d list=%+v", total, list)
 	}
 
-	// 没公开时公开列表是空的。
-	if _, total, err = store.publicGenerations(24, 0); err != nil || total != 0 {
-		t.Fatalf("公开列表应为空：total=%d err=%v", total, err)
-	}
-
-	// 公开之后才出现。
-	if _, err := store.setGenerationPublic(mine.ID, alice.ID, true); err != nil {
-		t.Fatalf("公开失败：%v", err)
-	}
+	// 新图默认就是公开的，两个人的都该在画坊上。
 	public, total, err := store.publicGenerations(24, 0)
-	if err != nil || total != 1 {
-		t.Fatalf("公开列表应有 1 条：total=%d err=%v", total, err)
+	if err != nil || total != 2 {
+		t.Fatalf("新图默认公开，公开列表应有 2 条：total=%d err=%v", total, err)
 	}
-	if public[0].Username != "alice" {
+	if public[0].Username == "" {
 		t.Fatalf("公开作品应带作者名，实际 %q", public[0].Username)
 	}
 
-	// 别人不能替 alice 取消公开。
-	if _, err := store.setGenerationPublic(mine.ID, bob.ID, false); err == nil {
+	// 取消公开之后才从画坊消失。
+	if _, err := store.setGenerationPublic(mine.ID, alice.ID, false); err != nil {
+		t.Fatalf("取消公开失败：%v", err)
+	}
+	if _, total, err = store.publicGenerations(24, 0); err != nil || total != 1 {
+		t.Fatalf("取消公开后应剩 1 条：total=%d err=%v", total, err)
+	}
+
+	// 别人不能替 alice 改公开状态。
+	if _, err := store.setGenerationPublic(mine.ID, bob.ID, true); err == nil {
 		t.Fatal("bob 不该能改 alice 的作品")
 	}
 	// 也不能删。
@@ -151,8 +151,8 @@ func TestGalleryVisibility(t *testing.T) {
 	if err := store.deleteGeneration(mine.ID, alice.ID); err != nil {
 		t.Fatalf("alice 删自己的应该成功：%v", err)
 	}
-	if _, total, _ = store.publicGenerations(24, 0); total != 0 {
-		t.Fatalf("删完公开列表应为空，实际 %d", total)
+	if _, total, _ = store.publicGenerations(24, 0); total != 1 {
+		t.Fatalf("删掉 alice 那条后应只剩 bob 的，实际 %d", total)
 	}
 	if _, err := store.generationByID(mine.ID); err == nil {
 		t.Fatal("删掉的作品不该还能查到")
