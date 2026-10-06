@@ -23,10 +23,15 @@ import (
 )
 
 const (
-	defaultUserAgent   = "darkroom/1.0 (local image studio)"
-	upstreamTimeout    = 120 * time.Second
-	pollDeadline       = 180 * time.Second
-	imageLimit         = 20 * 1024 * 1024
+	defaultUserAgent = "darkroom/1.0 (local image studio)"
+	upstreamTimeout  = 120 * time.Second
+	pollDeadline     = 180 * time.Second
+	// 单张图（参考图、蒙版、成品图）的上限。
+	//
+	// 64MB 这个数得和另外两处对上，改之前先看：
+	//   - bodyLimit（main.go）要装得下 base64，64MB 的图编码完是 ~85MB
+	//   - 服务端 max_allowed_packet 要够大，存图那边按它卡（见 Store.blobLimit）
+	imageLimit         = 64 * 1024 * 1024
 	imageFetchTimeout  = 60 * time.Second
 	batchOutputLimit   = 200
 	batchItemOutputMax = 4

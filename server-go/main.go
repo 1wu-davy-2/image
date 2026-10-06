@@ -24,7 +24,10 @@ import (
 )
 
 const (
-	bodyLimit       = 32 * 1024 * 1024
+	// 请求体上限。参考图是 base64 塞在 JSON 里发上来的，编码后是原图的 4/3，
+	// 64MB 的图就是 ~85MB，再加上 JSON 的外壳，96MB 才够。
+	// 改 imageLimit（relay.go）时记得回来对一下。
+	bodyLimit       = 96 * 1024 * 1024
 	userCookieName  = "darkroom_user"
 	adminCookieName = "darkroom_admin"
 )
@@ -48,17 +51,41 @@ type server struct {
 	handler http.Handler
 }
 
+// openDatabase 决定这次连哪个库。
+//
+// 设了 DB_HOST 就走 MariaDB，否则退回本地 SQLite 文件（DATA_FILE，默认
+// ../data/darkroom.db）。留 SQLite 这条退路是有用的：测试全跑在它上面，
+// 不用为了跑一遍测试去连远端；哪天远端挂了，改个环境变量就能先起来。
+func openDatabase() (*Store, error) {
+	host := strings.TrimSpace(os.Getenv("DB_HOST"))
+	if host == "" {
+		dataPath := os.Getenv("DATA_FILE")
+		if dataPath == "" {
+			dataPath = filepath.Join("..", "data", "darkroom.db")
+		}
+		return openStore(dataPath)
+	}
+	password := os.Getenv("DB_PASSWORD")
+	if password == "" {
+		return nil, errors.New("设了 DB_HOST 就必须给 DB_PASSWORD")
+	}
+	cfg := DBConfig{
+		Host:     host,
+		Port:     orDefault(os.Getenv("DB_PORT"), "3306"),
+		Name:     orDefault(os.Getenv("DB_NAME"), "image"),
+		User:     orDefault(os.Getenv("DB_USER"), "image"),
+		Password: password,
+	}
+	log.Printf("使用 MariaDB %s/%s", net.JoinHostPort(cfg.Host, cfg.Port), cfg.Name)
+	return openMariaDB(cfg)
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "6670"
 	}
-	dataPath := os.Getenv("DATA_FILE")
-	if dataPath == "" {
-		dataPath = filepath.Join("..", "data", "darkroom.db")
-	}
-
-	store, err := openStore(dataPath)
+	store, err := openDatabase()
 	if err != nil {
 		log.Fatalf("打开数据库失败：%v", err)
 	}

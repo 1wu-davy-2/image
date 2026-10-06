@@ -196,7 +196,7 @@ func TestModelTypeMigrationGuessesFromProtocol(t *testing.T) {
 	officialKey := seedKey(t, store, "o", "gemini-official", floatPtr(1), &yes, true)
 
 	// 模拟老库：这些 Key 建的时候还没有生图类型这一栏。
-	if _, err := store.db.Exec(`UPDATE keys SET model_type = ''`); err != nil {
+	if _, err := store.db.Exec(`UPDATE api_keys SET model_type = ''`); err != nil {
 		t.Fatalf("清类型失败：%v", err)
 	}
 	if err := store.migrateModelTypes(); err != nil {

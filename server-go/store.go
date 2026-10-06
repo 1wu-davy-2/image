@@ -4,15 +4,19 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"math"
 	// 签到额度要在区间里随机，用 math/rand/v2；crypto/rand 留给 newID 和加盐。
 	mrand "math/rand/v2"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"golang.org/x/crypto/scrypt"
 	_ "modernc.org/sqlite"
 )
@@ -177,10 +182,35 @@ type AdminState struct {
 	CheckinDate string             `json:"checkinDate"`
 }
 
+// 两种方言。建表语句是挑着两边都认的写法写的，只有少数几处必须分开，
+// 见 schemaTemplate 和各处的 dialect 分支。
+const (
+	dialectSQLite = "sqlite"
+	dialectMySQL  = "mysql"
+)
+
 type Store struct {
-	db *sql.DB
-	// SQLite 一次只允许一个写事务，用互斥锁把「读-改-写」串起来。
+	db      *sql.DB
+	dialect string
+	// packetLimit 是服务端 max_allowed_packet，存图要卡在它下面。0 表示没这限制。
+	// 连上库之后读一次，管理端把服务端调大了这边自动跟上，不用改代码。
+	packetLimit int
+	// 互斥锁把「读-改-写」串起来。
+	//
+	// 这原本是给 SQLite 准备的（一个连接 + 一把锁 = 天然全串行），换成 MariaDB
+	// 之后它照样管用，只是**只在单个进程内有效**：多开一个实例就各锁各的，
+	// 扣额度那种读-改-写会互相踩。要真正并发起来得把这二十来个方法改成
+	// 事务 + 行锁，那是另一件事，现在先保持串行——正确但慢，比快但错强。
 	mu sync.Mutex
+}
+
+// DBConfig 是连 MariaDB 要的那几样。密码从环境变量来，不落仓库。
+type DBConfig struct {
+	Host     string
+	Port     string
+	Name     string
+	User     string
+	Password string
 }
 
 func openStore(path string) (*Store, error) {
@@ -193,7 +223,82 @@ func openStore(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	store := &Store{db: db}
+	return newStore(db, dialectSQLite)
+}
+
+// loadCertPool 读一份 PEM 证书，用来校验服务端。
+func loadCertPool(path string) *x509.CertPool {
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		pool = x509.NewCertPool()
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("读 DB_TLS_CA 失败，退回系统信任库：%v", err)
+		return pool
+	}
+	if !pool.AppendCertsFromPEM(pem) {
+		log.Printf("DB_TLS_CA 里没解析出证书：%s", path)
+	}
+	return pool
+}
+
+// openMariaDB 连远端 MariaDB。连接池开小一点：应用层的互斥锁已经把写路径串起来了，
+// 开太多连接只是让服务端多几个空闲线程。
+func openMariaDB(cfg DBConfig) (*Store, error) {
+	mysqlCfg := mysql.NewConfig()
+	mysqlCfg.User = cfg.User
+	mysqlCfg.Passwd = cfg.Password
+	mysqlCfg.Net = "tcp"
+	mysqlCfg.Addr = net.JoinHostPort(cfg.Host, cfg.Port)
+	mysqlCfg.DBName = cfg.Name
+	// 时间统一按 UTC 存成字符串（见 now()），这里不依赖服务端的时区设置。
+	mysqlCfg.Params = map[string]string{"charset": "utf8mb4", "collation": "utf8mb4_bin"}
+	// 库在公网上，明文连等于把库密码、密码哈希和图片一起裸奔，所以默认强制加密。
+	// 服务端用的是自签证书，verify 会失败（x509: certificate signed by unknown authority），
+	// 所以取 skip-verify：防得住路上偷看，防不住中间人。
+	// 想彻底校验就把服务端证书的 CA 写进 DB_TLS_CA，那时把 DB_TLS 设成 true。
+	if ca := strings.TrimSpace(os.Getenv("DB_TLS_CA")); ca != "" {
+		if err := mysql.RegisterTLSConfig("darkroom", &tls.Config{
+			RootCAs:    loadCertPool(ca),
+			MinVersion: tls.VersionTLS12,
+		}); err != nil {
+			return nil, fmt.Errorf("注册 TLS 配置失败：%w", err)
+		}
+		mysqlCfg.Params["tls"] = "darkroom"
+	} else {
+		// 不填就按「必须加密但不校验证书」来。DB_TLS 可以覆盖成 preferred / false。
+		mysqlCfg.Params["tls"] = orDefault(strings.TrimSpace(os.Getenv("DB_TLS")), "skip-verify")
+	}
+
+	db, err := sql.Open("mysql", mysqlCfg.FormatDSN())
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(time.Hour)
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("连不上 MariaDB %s：%w", mysqlCfg.Addr, err)
+	}
+	store, err := newStore(db, dialectMySQL)
+	if err != nil {
+		return nil, err
+	}
+	// 读一次服务端的包上限，存图时卡在它下面（见 blobLimit）。
+	// 上面 MaxAllowedPacket 设的是 0，意思是「连上之后去问服务端」，
+	// 所以服务端调大了两边一起跟上，不用两头改。
+	if err := db.QueryRow(`SELECT @@max_allowed_packet`).Scan(&store.packetLimit); err != nil {
+		log.Printf("读不到 max_allowed_packet，存图按 %dMB 处理：%v", store.blobLimit()/1024/1024, err)
+	} else {
+		log.Printf("服务端 max_allowed_packet = %dMB，单张图最多存 %dMB",
+			store.packetLimit/1024/1024, store.blobLimit()/1024/1024)
+	}
+	return store, nil
+}
+
+func newStore(db *sql.DB, dialect string) (*Store, error) {
+	store := &Store{db: db, dialect: dialect}
 	if err := store.migrate(); err != nil {
 		return nil, err
 	}
@@ -201,123 +306,16 @@ func openStore(path string) (*Store, error) {
 }
 
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS settings (
-  id             INTEGER PRIMARY KEY CHECK (id = 1),
-  checkin_min    INTEGER NOT NULL DEFAULT 5,
-  checkin_max    INTEGER NOT NULL DEFAULT 5,
-  generate_cost  INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS admin (
-  id       INTEGER PRIMARY KEY CHECK (id = 1),
-  username TEXT NOT NULL,
-  salt     BLOB NOT NULL,
-  hash     BLOB NOT NULL
-);
-CREATE TABLE IF NOT EXISTS users (
-  id                TEXT PRIMARY KEY,
-  username          TEXT NOT NULL,
-  username_lower    TEXT NOT NULL UNIQUE,
-  display_name      TEXT NOT NULL DEFAULT '',
-  phone             TEXT NOT NULL DEFAULT '',
-  email             TEXT NOT NULL DEFAULT '',
-  email_lower       TEXT NOT NULL DEFAULT '',
-  salt              BLOB NOT NULL,
-  hash              BLOB NOT NULL,
-  quota             INTEGER NOT NULL DEFAULT 0,
-  disabled          INTEGER NOT NULL DEFAULT 0,
-  is_admin          INTEGER NOT NULL DEFAULT 0,
-  last_checkin_date TEXT NOT NULL DEFAULT '',
-  created_at        TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS sessions (
-  token      TEXT PRIMARY KEY,
-  role       TEXT NOT NULL,
-  user_id    TEXT NOT NULL DEFAULT '',
-  expires_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
-CREATE TABLE IF NOT EXISTS keys (
-  id                 TEXT PRIMARY KEY,
-  name               TEXT NOT NULL,
-  protocol           TEXT NOT NULL,
-  base_url           TEXT NOT NULL,
-  api_key            TEXT NOT NULL,
-  user_agent         TEXT NOT NULL DEFAULT '',
-  balance            REAL,
-  balance_unit       TEXT NOT NULL DEFAULT 'USD',
-  balance_valid      INTEGER,
-  balance_updated_at TEXT NOT NULL DEFAULT '',
-  balance_error      TEXT NOT NULL DEFAULT '',
-  models             TEXT NOT NULL DEFAULT '',
-  models_updated_at  TEXT NOT NULL DEFAULT '',
-  models_error       TEXT NOT NULL DEFAULT '',
-  enabled            INTEGER NOT NULL DEFAULT 1,
-  note               TEXT NOT NULL DEFAULT '',
-  last_used_at       INTEGER NOT NULL DEFAULT 0,
-  created_at         TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS generations (
-  id          TEXT PRIMARY KEY,
-  user_id     TEXT NOT NULL,
-  prompt      TEXT NOT NULL,
-  protocol    TEXT NOT NULL,
-  model       TEXT NOT NULL,
-  size_label  TEXT NOT NULL DEFAULT '',
-  channel     TEXT NOT NULL DEFAULT '',
-  task_id     TEXT NOT NULL DEFAULT '',
-  is_public   INTEGER NOT NULL DEFAULT 0,
-  created_at  TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS generations_user ON generations(user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS generations_public ON generations(is_public, created_at DESC);
-CREATE TABLE IF NOT EXISTS generation_images (
-  id            TEXT PRIMARY KEY,
-  generation_id TEXT NOT NULL,
-  position      INTEGER NOT NULL,
-  mime          TEXT NOT NULL DEFAULT '',
-  source_url    TEXT NOT NULL DEFAULT '',
-  bytes         BLOB
-);
-CREATE INDEX IF NOT EXISTS generation_images_gen ON generation_images(generation_id, position);
-CREATE TABLE IF NOT EXISTS checkins (
-  id         TEXT PRIMARY KEY,
-  user_id    TEXT NOT NULL,
-  day        TEXT NOT NULL,
-  amount     INTEGER NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS checkins_user ON checkins(user_id, created_at DESC);
-CREATE TABLE IF NOT EXISTS model_types (
-  type          TEXT PRIMARY KEY,
-  default_model TEXT NOT NULL DEFAULT '',
-  multiplier    REAL NOT NULL DEFAULT 1,
-  updated_at    TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS model_rates (
-  model_id   TEXT PRIMARY KEY,
-  multiplier REAL NOT NULL DEFAULT 1,
-  updated_at TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS audit_logs (
-  id         TEXT PRIMARY KEY,
-  actor_kind TEXT NOT NULL DEFAULT 'user',
-  actor_id   TEXT NOT NULL DEFAULT '',
-  actor_name TEXT NOT NULL DEFAULT '',
-  action     TEXT NOT NULL,
-  target     TEXT NOT NULL DEFAULT '',
-  detail     TEXT NOT NULL DEFAULT '',
-  ip         TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS audit_logs_created ON audit_logs(created_at DESC);
-CREATE INDEX IF NOT EXISTS audit_logs_action ON audit_logs(action, created_at DESC);
-INSERT OR IGNORE INTO settings (id) VALUES (1);
-`)
-	if err != nil {
+	if err := s.migrateRenameKeys(); err != nil {
 		return err
 	}
-	// 老库补列：SQLite 没有 ADD COLUMN IF NOT EXISTS，先查 PRAGMA 再补。
+	if err := execScript(s.db, s.schemaSQL()); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(s.insertIgnore("settings", "id") + " VALUES (1)"); err != nil {
+		return err
+	}
+	// 老库补列：SQLite 没有 ADD COLUMN IF NOT EXISTS，先查一遍现有列再补。
 	if err := s.addMissingColumns("users", [][2]string{
 		{"display_name", "TEXT NOT NULL DEFAULT ''"},
 		{"phone", "TEXT NOT NULL DEFAULT ''"},
@@ -327,7 +325,7 @@ INSERT OR IGNORE INTO settings (id) VALUES (1);
 	}); err != nil {
 		return err
 	}
-	if err := s.addMissingColumns("keys", [][2]string{
+	if err := s.addMissingColumns("api_keys", [][2]string{
 		{"models", "TEXT NOT NULL DEFAULT ''"},
 		{"models_updated_at", "TEXT NOT NULL DEFAULT ''"},
 		{"models_error", "TEXT NOT NULL DEFAULT ''"},
@@ -335,14 +333,51 @@ INSERT OR IGNORE INTO settings (id) VALUES (1);
 	}); err != nil {
 		return err
 	}
-	// 邮箱要能当登录名，所以唯一。老库补列留下的空串不参与唯一，故用条件索引。
-	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email_lower) WHERE email_lower <> ''`); err != nil {
+	if err := s.ensureEmailIndex(); err != nil {
 		return err
 	}
 	if err := s.migrateCheckinRange(); err != nil {
 		return err
 	}
 	return s.migrateModelTypes()
+}
+
+// migrateRenameKeys 把老库的 keys 表改名成 api_keys。
+//
+// keys 是 MariaDB 的保留字，不加反引号就查不了；与其在十几条语句里到处补引号
+// （Go 的原始字符串里还写不了反引号），不如换个名字。SQLite 这边跟着一起改，
+// 免得两边表名不一样。
+func (s *Store) migrateRenameKeys() error {
+	old, err := s.tableColumns("keys")
+	if err != nil || len(old) == 0 {
+		return err
+	}
+	current, err := s.tableColumns("api_keys")
+	if err != nil {
+		return err
+	}
+	if len(current) > 0 {
+		return nil
+	}
+	// 这条得用双引号字符串写：Go 的原始字符串（反引号）里放不下反引号。
+	if _, err := s.db.Exec("ALTER TABLE `keys` RENAME TO api_keys"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureEmailIndex 让邮箱能当登录名（唯一）。
+//
+// 两边写法不一样：SQLite 用条件索引把空串排除掉（老库补列时会留下一批空串，
+// 它们不该互相冲突）；MariaDB 不支持条件索引，靠的是「注册必须填邮箱」这条
+// 业务规则——真出现第二个空串会直接报唯一冲突，宁可报错也别让两个账号撞名。
+func (s *Store) ensureEmailIndex() error {
+	statement := `CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email_lower)`
+	if s.dialect == dialectSQLite {
+		statement += ` WHERE email_lower <> ''`
+	}
+	_, err := s.db.Exec(statement)
+	return err
 }
 
 // migrateModelTypes 给生图类型表铺好三行，并把老 Key 按调用方式猜一个类型。
@@ -353,7 +388,7 @@ INSERT OR IGNORE INTO settings (id) VALUES (1);
 func (s *Store) migrateModelTypes() error {
 	for _, item := range modelTypeList {
 		if _, err := s.db.Exec(
-			`INSERT OR IGNORE INTO model_types (type, default_model, multiplier) VALUES (?, ?, 1)`,
+			s.insertIgnore("model_types", "type, default_model, multiplier")+" VALUES (?, ?, 1)",
 			item.Type, item.DefaultModel,
 		); err != nil {
 			return err
@@ -361,7 +396,7 @@ func (s *Store) migrateModelTypes() error {
 	}
 	for protocol := range protocols {
 		if _, err := s.db.Exec(
-			`UPDATE keys SET model_type = ? WHERE model_type = '' AND protocol = ?`,
+			`UPDATE api_keys SET model_type = ? WHERE model_type = '' AND protocol = ?`,
 			guessModelType(protocol), protocol,
 		); err != nil {
 			return err
@@ -406,14 +441,225 @@ func (s *Store) migrateCheckinRange() error {
 	return err
 }
 
+/* ---------- 方言差异 ---------- */
+
+// schemaTemplate 是建表语句。类型挑的是两边都认的写法：
+//   - VARCHAR 在 SQLite 里是 TEXT 亲和，在 MariaDB 里是真 VARCHAR，两边都能建索引
+//   - LONGBLOB 在 SQLite 里是 BLOB 亲和，在 MariaDB 里能装下 20MB 的图
+//   - TEXT 带 DEFAULT 两边都认（**MySQL 不认，只有 MariaDB 认**，所以这个项目
+//     换到 MySQL 上会挂在这几十个 DEFAULT ” 上）
+//   - REAL 两边都认，但 MariaDB 认成 DOUBLE，显式写 DOUBLE 更清楚
+//
+// 主键和索引列不能用 TEXT：MariaDB 要求给前缀长度，索性统一 VARCHAR(64)——
+// id 是 16 位十六进制、token 是 48 位，都够。
+//
+// 只有审计表的插入序号必须分开：SQLite 有隐式 rowid，MariaDB 得显式给一列。
+const schemaTemplate = `
+CREATE TABLE IF NOT EXISTS settings (
+  id             INTEGER PRIMARY KEY CHECK (id = 1),
+  checkin_min    INTEGER NOT NULL DEFAULT 5,
+  checkin_max    INTEGER NOT NULL DEFAULT 5,
+  generate_cost  INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS admin (
+  id       INTEGER PRIMARY KEY CHECK (id = 1),
+  username VARCHAR(64) NOT NULL,
+  salt     BLOB NOT NULL,
+  hash     BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS users (
+  id                VARCHAR(64) PRIMARY KEY,
+  username          VARCHAR(64) NOT NULL,
+  username_lower    VARCHAR(64) NOT NULL UNIQUE,
+  display_name      VARCHAR(64) NOT NULL DEFAULT '',
+  phone             VARCHAR(32) NOT NULL DEFAULT '',
+  email             VARCHAR(255) NOT NULL DEFAULT '',
+  email_lower       VARCHAR(255) NOT NULL DEFAULT '',
+  salt              BLOB NOT NULL,
+  hash              BLOB NOT NULL,
+  quota             INTEGER NOT NULL DEFAULT 0,
+  disabled          INTEGER NOT NULL DEFAULT 0,
+  is_admin          INTEGER NOT NULL DEFAULT 0,
+  last_checkin_date VARCHAR(32) NOT NULL DEFAULT '',
+  created_at        VARCHAR(32) NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  token      VARCHAR(64) PRIMARY KEY,
+  role       VARCHAR(16) NOT NULL,
+  user_id    VARCHAR(64) NOT NULL DEFAULT '',
+  expires_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS api_keys (
+  id                 VARCHAR(64) PRIMARY KEY,
+  name               VARCHAR(255) NOT NULL,
+  protocol           VARCHAR(32) NOT NULL,
+  base_url           VARCHAR(512) NOT NULL,
+  api_key            VARCHAR(512) NOT NULL,
+  user_agent         VARCHAR(255) NOT NULL DEFAULT '',
+  balance            DOUBLE,
+  balance_unit       VARCHAR(16) NOT NULL DEFAULT 'USD',
+  balance_valid      INTEGER,
+  balance_updated_at VARCHAR(32) NOT NULL DEFAULT '',
+  balance_error      TEXT NOT NULL DEFAULT '',
+  models             TEXT NOT NULL DEFAULT '',
+  models_updated_at  VARCHAR(32) NOT NULL DEFAULT '',
+  models_error       TEXT NOT NULL DEFAULT '',
+  enabled            INTEGER NOT NULL DEFAULT 1,
+  note               TEXT NOT NULL DEFAULT '',
+  last_used_at       BIGINT NOT NULL DEFAULT 0,
+  created_at         VARCHAR(32) NOT NULL,
+  model_type         VARCHAR(32) NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS generations (
+  id          VARCHAR(64) PRIMARY KEY,
+  user_id     VARCHAR(64) NOT NULL,
+  prompt      TEXT NOT NULL,
+  protocol    VARCHAR(32) NOT NULL,
+  model       VARCHAR(128) NOT NULL,
+  size_label  VARCHAR(64) NOT NULL DEFAULT '',
+  channel     VARCHAR(32) NOT NULL DEFAULT '',
+  task_id     VARCHAR(128) NOT NULL DEFAULT '',
+  is_public   INTEGER NOT NULL DEFAULT 0,
+  created_at  VARCHAR(32) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS generations_user ON generations(user_id, created_at);
+CREATE INDEX IF NOT EXISTS generations_public ON generations(is_public, created_at);
+CREATE TABLE IF NOT EXISTS generation_images (
+  id            VARCHAR(64) PRIMARY KEY,
+  generation_id VARCHAR(64) NOT NULL,
+  position      INTEGER NOT NULL,
+  mime          VARCHAR(64) NOT NULL DEFAULT '',
+  source_url    TEXT,
+  bytes         LONGBLOB
+);
+CREATE INDEX IF NOT EXISTS generation_images_gen ON generation_images(generation_id, position);
+CREATE TABLE IF NOT EXISTS checkins (
+  id         VARCHAR(64) PRIMARY KEY,
+  user_id    VARCHAR(64) NOT NULL,
+  day        VARCHAR(32) NOT NULL,
+  amount     INTEGER NOT NULL,
+  created_at VARCHAR(32) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS checkins_user ON checkins(user_id, created_at);
+CREATE TABLE IF NOT EXISTS model_types (
+  type          VARCHAR(32) PRIMARY KEY,
+  default_model VARCHAR(128) NOT NULL DEFAULT '',
+  multiplier    DOUBLE NOT NULL DEFAULT 1,
+  updated_at    VARCHAR(32) NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS model_rates (
+  model_id   VARCHAR(128) PRIMARY KEY,
+  multiplier DOUBLE NOT NULL DEFAULT 1,
+  updated_at VARCHAR(32) NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id         VARCHAR(64) PRIMARY KEY,
+/*AUDIT_SEQ*/
+  actor_kind VARCHAR(16) NOT NULL DEFAULT 'user',
+  actor_id   VARCHAR(64) NOT NULL DEFAULT '',
+  actor_name VARCHAR(255) NOT NULL DEFAULT '',
+  action     VARCHAR(64) NOT NULL,
+  target     VARCHAR(255) NOT NULL DEFAULT '',
+  detail     TEXT NOT NULL DEFAULT '',
+  ip         VARCHAR(64) NOT NULL DEFAULT '',
+  created_at VARCHAR(32) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_logs_created ON audit_logs(created_at);
+CREATE INDEX IF NOT EXISTS audit_logs_action ON audit_logs(action, created_at);
+`
+
+// execScript 一条条执行建表语句。
+//
+// MariaDB 默认不允许一次 Exec 发多条语句（要开 multiStatements，那等于把注入面
+// 放大到「一句变多句」，不值当），所以自己按分号拆。建表语句里没有分号出现在
+// 字符串字面量里的情况，直接拆是安全的。
+func execScript(db *sql.DB, script string) error {
+	for _, statement := range strings.Split(script, ";") {
+		statement = strings.TrimSpace(statement)
+		if statement == "" {
+			continue
+		}
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("%w（出错的语句：%.90s）", err, statement)
+		}
+	}
+	return nil
+}
+
+func (s *Store) schemaSQL() string {
+	// SQLite 的 rowid 是白送的插入序号；MariaDB 得显式给一列并建唯一键
+	// （AUTO_INCREMENT 必须是某个键的一部分）。
+	seq := ""
+	if s.dialect == dialectMySQL {
+		seq = "  seq        BIGINT NOT NULL AUTO_INCREMENT,\n  UNIQUE KEY audit_logs_seq (seq),"
+	}
+	return strings.Replace(schemaTemplate, "/*AUDIT_SEQ*/", seq, 1)
+}
+
+// insertIgnore 拼「已经有一条就跳过」的插入语句，两种方言写法不一样。
+func (s *Store) insertIgnore(table, columns string) string {
+	if s.dialect == dialectMySQL {
+		return "INSERT IGNORE INTO " + table + " (" + columns + ")"
+	}
+	return "INSERT OR IGNORE INTO " + table + " (" + columns + ")"
+}
+
+// upsertAdmin 是 admin 表那唯一一行的「有则改、无则插」。
+func (s *Store) upsertAdmin() string {
+	if s.dialect == dialectMySQL {
+		return `INSERT INTO admin (id, username, salt, hash) VALUES (1, ?, ?, ?)
+			ON DUPLICATE KEY UPDATE username = VALUES(username), salt = VALUES(salt), hash = VALUES(hash)`
+	}
+	return `INSERT INTO admin (id, username, salt, hash) VALUES (1, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET username = excluded.username, salt = excluded.salt, hash = excluded.hash`
+}
+
+// upsertModelRate 同理，model_rates 按 model_id 覆盖。
+func (s *Store) upsertModelRate() string {
+	if s.dialect == dialectMySQL {
+		return `INSERT INTO model_rates (model_id, multiplier, updated_at) VALUES (?, ?, ?)
+			ON DUPLICATE KEY UPDATE multiplier = VALUES(multiplier), updated_at = VALUES(updated_at)`
+	}
+	return `INSERT INTO model_rates (model_id, multiplier, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(model_id) DO UPDATE SET multiplier = excluded.multiplier, updated_at = excluded.updated_at`
+}
+
+// auditOrder 是审计日志翻页用的排序。不能按 created_at：时间戳只到秒，
+// 同一秒里连着发生的几件事按时间排会乱套，而审计要看的恰恰是先后。
+// SQLite 用隐式 rowid，MariaDB 用显式 seq 列，两者都是插入顺序。
+func (s *Store) auditOrder() string {
+	if s.dialect == dialectMySQL {
+		return "seq DESC"
+	}
+	return "rowid DESC"
+}
+
 // tableColumns 列出表上现有的列名。
 func (s *Store) tableColumns(table string) (map[string]bool, error) {
+	existing := map[string]bool{}
+	if s.dialect == dialectMySQL {
+		rows, err := s.db.Query(`SELECT column_name FROM information_schema.columns
+			WHERE table_schema = DATABASE() AND table_name = ?`, table)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return nil, err
+			}
+			existing[name] = true
+		}
+		return existing, rows.Err()
+	}
+
 	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	existing := map[string]bool{}
 	for rows.Next() {
 		var (
 			cid, notNull, pk int
@@ -525,9 +771,7 @@ func (s *Store) ensureAdminRow() error {
 			return nil
 		}
 		newSalt, newHash := hashPassword(envPassword)
-		if _, err := s.db.Exec(`INSERT INTO admin (id, username, salt, hash) VALUES (1, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET username = excluded.username, salt = excluded.salt, hash = excluded.hash`,
-			username, newSalt, newHash); err != nil {
+		if _, err := s.db.Exec(s.upsertAdmin(), username, newSalt, newHash); err != nil {
 			return err
 		}
 		fmt.Printf("管理端账号已按环境变量对齐：%s\n", username)
@@ -1105,7 +1349,7 @@ func scanKey(row interface{ Scan(...any) error }) (Key, error) {
 }
 
 func (s *Store) keys() ([]Key, error) {
-	rows, err := s.db.Query(`SELECT ` + keyColumns + ` FROM keys ORDER BY created_at`)
+	rows, err := s.db.Query(`SELECT ` + keyColumns + ` FROM api_keys ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -1122,7 +1366,7 @@ func (s *Store) keys() ([]Key, error) {
 }
 
 func (s *Store) keyByID(id string) (Key, error) {
-	return scanKey(s.db.QueryRow(`SELECT `+keyColumns+` FROM keys WHERE id = ?`, id))
+	return scanKey(s.db.QueryRow(`SELECT `+keyColumns+` FROM api_keys WHERE id = ?`, id))
 }
 
 // relayBalance 把启用中的 Key 的余额加起来。停用的 Key 不算——它已经不参与挑 Key 了，
@@ -1188,7 +1432,7 @@ func (s *Store) saveKey(in KeyInput) (Key, error) {
 
 	if in.ID == "" {
 		id := newID()
-		if _, err := s.db.Exec(`INSERT INTO keys (id, name, protocol, model_type, base_url, api_key, user_agent, balance,
+		if _, err := s.db.Exec(`INSERT INTO api_keys (id, name, protocol, model_type, base_url, api_key, user_agent, balance,
 			balance_unit, balance_valid, balance_updated_at, balance_error, enabled, note, last_used_at, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'USD', NULL, '', '', ?, ?, 0, ?)`,
 			id, name, in.Protocol, in.ModelType, in.BaseURL, in.APIKey, in.UserAgent, in.Balance, boolToInt(in.Enabled), string(note), s.now()); err != nil {
@@ -1219,7 +1463,7 @@ func (s *Store) saveKey(in KeyInput) (Key, error) {
 		valid = nil
 		balanceError = ""
 	}
-	if _, err := s.db.Exec(`UPDATE keys SET name = ?, protocol = ?, model_type = ?, base_url = ?, api_key = ?, user_agent = ?,
+	if _, err := s.db.Exec(`UPDATE api_keys SET name = ?, protocol = ?, model_type = ?, base_url = ?, api_key = ?, user_agent = ?,
 		balance = ?, balance_valid = ?, balance_error = ?, enabled = ?, note = ? WHERE id = ?`,
 		name, in.Protocol, in.ModelType, in.BaseURL, apiKey, in.UserAgent, in.Balance, boolPtrToInt(valid), balanceError,
 		boolToInt(in.Enabled), string(note), in.ID); err != nil {
@@ -1231,7 +1475,7 @@ func (s *Store) saveKey(in KeyInput) (Key, error) {
 func (s *Store) deleteKey(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`DELETE FROM keys WHERE id = ?`, id)
+	res, err := s.db.Exec(`DELETE FROM api_keys WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
@@ -1245,7 +1489,7 @@ func (s *Store) setKeyBalance(id string, balance *float64, unit string, valid *b
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if balance != nil {
-		if _, err := s.db.Exec(`UPDATE keys SET balance = ?, balance_unit = ?, balance_valid = ?,
+		if _, err := s.db.Exec(`UPDATE api_keys SET balance = ?, balance_unit = ?, balance_valid = ?,
 			balance_updated_at = ?, balance_error = '' WHERE id = ?`,
 			*balance, unit, boolPtrToInt(valid), s.now(), id); err != nil {
 			return Key{}, err
@@ -1255,7 +1499,7 @@ func (s *Store) setKeyBalance(id string, balance *float64, unit string, valid *b
 		if len([]rune(trimmed)) > 300 {
 			trimmed = string([]rune(trimmed)[:300])
 		}
-		if _, err := s.db.Exec(`UPDATE keys SET balance_error = ? WHERE id = ?`, trimmed, id); err != nil {
+		if _, err := s.db.Exec(`UPDATE api_keys SET balance_error = ? WHERE id = ?`, trimmed, id); err != nil {
 			return Key{}, err
 		}
 	}
@@ -1271,7 +1515,7 @@ func (s *Store) setKeyModels(id string, models []ModelInfo, errMessage string) (
 		if len([]rune(trimmed)) > 300 {
 			trimmed = string([]rune(trimmed)[:300])
 		}
-		if _, err := s.db.Exec(`UPDATE keys SET models_error = ? WHERE id = ?`, trimmed, id); err != nil {
+		if _, err := s.db.Exec(`UPDATE api_keys SET models_error = ? WHERE id = ?`, trimmed, id); err != nil {
 			return Key{}, err
 		}
 		return s.keyByID(id)
@@ -1280,7 +1524,7 @@ func (s *Store) setKeyModels(id string, models []ModelInfo, errMessage string) (
 	if err != nil {
 		return Key{}, err
 	}
-	if _, err := s.db.Exec(`UPDATE keys SET models = ?, models_updated_at = ?, models_error = '' WHERE id = ?`,
+	if _, err := s.db.Exec(`UPDATE api_keys SET models = ?, models_updated_at = ?, models_error = '' WHERE id = ?`,
 		string(encoded), s.now(), id); err != nil {
 		return Key{}, err
 	}
@@ -1488,11 +1732,7 @@ func (s *Store) saveModelRate(modelID string, multiplier float64) (map[string]fl
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(
-		`INSERT INTO model_rates (model_id, multiplier, updated_at) VALUES (?, ?, ?)
-		 ON CONFLICT(model_id) DO UPDATE SET multiplier = excluded.multiplier, updated_at = excluded.updated_at`,
-		modelID, multiplier, s.now(),
-	); err != nil {
+	if _, err := s.db.Exec(s.upsertModelRate(), modelID, multiplier, s.now()); err != nil {
 		return nil, err
 	}
 	return s.modelRates()
@@ -1668,7 +1908,7 @@ func (s *Store) reserve(userID string, multiplier float64, units int, pick func(
 	if _, err := s.db.Exec(`UPDATE users SET quota = quota - ? WHERE id = ?`, cost, userID); err != nil {
 		return Key{}, 0, 0, err
 	}
-	if _, err := s.db.Exec(`UPDATE keys SET last_used_at = ? WHERE id = ?`, time.Now().UnixMilli(), key.ID); err != nil {
+	if _, err := s.db.Exec(`UPDATE api_keys SET last_used_at = ? WHERE id = ?`, time.Now().UnixMilli(), key.ID); err != nil {
 		return Key{}, 0, 0, err
 	}
 	return key, cost, user.Quota - cost, nil
@@ -2007,14 +2247,46 @@ func (s *Store) fillGenerationImages(generationID string) {
 		if len(data) == 0 {
 			continue
 		}
+		// 远端 MariaDB 的 max_allowed_packet 是 16MB，超了这条 UPDATE 会被整个拒掉，
+		// 而且**连接会跟着断**（实测），后面几条跟着一起失败。所以宁可不存：
+		// source_url 还在，作品集那边会退回用上游链接，图照样看得见，只是链接会过期。
+		if len(data) > s.blobLimit() {
+			log.Printf("[gallery] 图太大（%.1fMB，上限 %dMB），只留上游链接：%s",
+				float64(len(data))/1024/1024, s.blobLimit()/1024/1024, item.id)
+			continue
+		}
 		s.mu.Lock()
+		var err error
 		if mime != "" {
-			s.db.Exec(`UPDATE generation_images SET bytes = ?, mime = ? WHERE id = ?`, data, mime, item.id)
+			_, err = s.db.Exec(`UPDATE generation_images SET bytes = ?, mime = ? WHERE id = ?`, data, mime, item.id)
 		} else {
-			s.db.Exec(`UPDATE generation_images SET bytes = ? WHERE id = ?`, data, item.id)
+			_, err = s.db.Exec(`UPDATE generation_images SET bytes = ? WHERE id = ?`, data, item.id)
 		}
 		s.mu.Unlock()
+		if err != nil {
+			log.Printf("[gallery] 存图失败（%s）：%v", item.id, err)
+		}
 	}
+}
+
+// blobLimit 是单张图能写进库的上限。
+//
+// MariaDB 那边受服务端 max_allowed_packet 卡着：超了不只是这条 UPDATE 失败，
+// **连接会跟着断**（实测），同一个连接上后面几条查询一起完蛋。所以这里主动卡住，
+// 超了就干脆不写库，只留 source_url——作品集那边会退回用上游链接，图照样看得见，
+// 只是链接会过期。
+//
+// 上限取「服务端的包上限 - 1MB」（那 1MB 留给 SQL 语句本身和协议开销），
+// 再和 imageLimit 取小的那个。服务端调大了这边自动跟上。
+func (s *Store) blobLimit() int {
+	if s.packetLimit <= 0 {
+		return imageLimit
+	}
+	room := s.packetLimit - 1024*1024
+	if room < imageLimit {
+		return room
+	}
+	return imageLimit
 }
 
 /* ---------- 审计日志 ---------- */
@@ -2067,7 +2339,7 @@ func (s *Store) auditLogs(action string, limit, offset int) ([]AuditEntry, int, 
 	}
 	pageArgs := append(append([]any{}, args...), limit, offset)
 	rows, err := s.db.Query(`SELECT id, actor_kind, actor_id, actor_name, action, target, detail, ip, created_at
-		FROM audit_logs`+where+` ORDER BY rowid DESC LIMIT ? OFFSET ?`, pageArgs...)
+		FROM audit_logs`+where+` ORDER BY `+s.auditOrder()+` LIMIT ? OFFSET ?`, pageArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
