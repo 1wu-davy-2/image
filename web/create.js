@@ -309,11 +309,12 @@ function showResult(entry) {
   actions.replaceChildren();
   images.forEach((image, index) => {
     const src = imageSrc(image);
-    const open = document.createElement("a");
-    open.href = src;
-    open.target = "_blank";
-    open.rel = "noopener";
-    open.textContent = images.length > 1 ? `打开 ${index + 1}` : "打开原图";
+    // 点开看是页内放大，不跳新标签页。想存下来用旁边的「下载」。
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "small";
+    open.textContent = images.length > 1 ? `放大 ${index + 1}` : "放大查看";
+    open.addEventListener("click", () => window.Darkroom.openLightbox(src, entry.prompt));
     const download = document.createElement("a");
     download.href = src;
     download.download = `darkroom-${Date.now()}${images.length > 1 ? `-${index + 1}` : ""}.png`;

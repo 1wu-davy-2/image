@@ -216,7 +216,51 @@ function imageURL(generation, position) {
   return api(`/api/generations/${encodeURIComponent(generation.id)}/images/${position}`);
 }
 
-window.Darkroom = { api, ready, refreshMe, setQuota, formatDate, imageURL };
+/* ---------- 放大查看 ---------- */
+
+// 点图放大，而不是跳新标签页：一跳走，回来得重新找看到哪儿了。
+// 放在 shell 里是因为创作页和作品集都要用，两边都加载了这个文件。
+// 点背景或按 Esc 关闭；点图本身不关——多半是想凑近看，不是想退出。
+let lightbox = null;
+
+function closeLightbox() {
+  if (!lightbox) return;
+  lightbox.remove();
+  lightbox = null;
+  document.removeEventListener("keydown", onLightboxKey);
+}
+
+function onLightboxKey(event) {
+  if (event.key === "Escape") closeLightbox();
+}
+
+function openLightbox(src, caption) {
+  closeLightbox();
+  lightbox = document.createElement("div");
+  lightbox.className = "lightbox";
+  lightbox.setAttribute("role", "dialog");
+  lightbox.setAttribute("aria-modal", "true");
+  lightbox.setAttribute("aria-label", caption || "放大查看");
+
+  const img = document.createElement("img");
+  img.src = src;
+  img.alt = caption || "";
+  lightbox.append(img);
+
+  if (caption) {
+    const note = document.createElement("p");
+    note.className = "lightbox-caption";
+    note.textContent = caption;
+    lightbox.append(note);
+  }
+
+  img.addEventListener("click", (event) => event.stopPropagation());
+  lightbox.addEventListener("click", closeLightbox);
+  document.addEventListener("keydown", onLightboxKey);
+  document.body.append(lightbox);
+}
+
+window.Darkroom = { api, ready, refreshMe, setQuota, formatDate, imageURL, openLightbox };
 
 // 顶栏那份不依赖登录态，先画出来，别等 /api/me 回来才出现。
 renderTopNav();
