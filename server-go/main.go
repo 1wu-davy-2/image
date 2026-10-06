@@ -112,6 +112,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/checkin", s.wrap(s.checkin))
 	mux.HandleFunc("GET /api/checkins", s.wrap(s.checkinList))
 	mux.HandleFunc("GET /api/models", s.wrap(s.availableModels))
+	mux.HandleFunc("GET /api/types", s.wrap(s.generationTypes))
 	mux.HandleFunc("POST /api/me/password", s.wrap(s.changeMyPassword))
 	mux.HandleFunc("POST /api/generate", s.wrap(s.generateHandler))
 
@@ -143,6 +144,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/admin/keys/{id}", s.wrap(s.adminDeleteKey))
 	mux.HandleFunc("POST /api/admin/keys/{id}/balance", s.wrap(s.adminRefreshBalance))
 	mux.HandleFunc("POST /api/admin/keys/{id}/models", s.wrap(s.adminRefreshModels))
+	mux.HandleFunc("PUT /api/admin/types/{type}", s.wrap(s.adminSaveType))
 	mux.HandleFunc("PATCH /api/admin/users/{id}", s.wrap(s.adminPatchUser))
 	mux.HandleFunc("DELETE /api/admin/users/{id}", s.wrap(s.adminDeleteUser))
 	mux.HandleFunc("POST /api/admin/users/{id}/password", s.wrap(s.adminResetUserPassword))
@@ -549,13 +551,26 @@ func (s *server) me(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	writeJSON(w, 200, map[string]any{
+	payload := map[string]any{
 		"ok":           true,
 		"user":         user,
 		"checkinMin":   settings.CheckinMin,
 		"checkinMax":   settings.CheckinMax,
 		"generateCost": settings.GenerateCost,
-	})
+	}
+	// 中转站还剩多少钱：管理员看真账，别人看模糊过的。模糊在后端做，
+	// 真数字根本不下发——不然它在网络响应里躺着，翻一下 devtools 就看见了。
+	// 没查过余额就不带这个字段，前端据此不显示。
+	if user != nil {
+		if balance, ok := s.store.relayBalance(); ok {
+			if user.IsAdmin {
+				payload["relayBalance"] = balance
+			} else {
+				payload["relayBalance"] = blurBalance(balance, user.ID)
+			}
+		}
+	}
+	writeJSON(w, 200, payload)
 	return nil
 }
 
@@ -612,20 +627,51 @@ func (s *server) generateHandler(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	protocol, err := parseProtocol(body["protocol"])
-	if err != nil {
-		return err
-	}
-	if protocol == batchProtocol {
-		return fail(400, "批量生图请用 /api/batches 提交")
-	}
-	spec, err := buildSpec(r.Context(), body, protocol)
-	if err != nil {
-		return err
+	// 两种调用姿势：
+	//   type   —— 用户端现在的走法。只挑生图类型，模型走管理端配的默认模型，
+	//             调用方式由挑中的那把 Key 决定，费用按类型的倍率算。
+	//   protocol —— 老的走法，直接指定调用方式和模型，倍率按 1 算。
+	modelType := strings.TrimSpace(firstString(body["type"]))
+	var protocol string
+	var key Key
+	var cost, quota int
+
+	if modelType != "" {
+		if !validModelType(modelType) {
+			return fail(400, "不认识的生图类型")
+		}
+		var picked ModelType
+		key, picked, cost, quota, err = s.store.reserveForType(user.ID, modelType, 1)
+		if err != nil {
+			return err
+		}
+		protocol = key.Protocol
+		// 模型不由用户选，用这个类型的默认模型。
+		body["model"] = picked.DefaultModel
+	} else {
+		protocol, err = parseProtocol(body["protocol"])
+		if err != nil {
+			return err
+		}
+		if protocol == batchProtocol {
+			return fail(400, "批量生图请用 /api/batches 提交")
+		}
+		key, cost, quota, err = s.store.reserveGeneration(user.ID, protocol, 1)
+		if err != nil {
+			return err
+		}
 	}
 
-	key, cost, quota, err := s.store.reserveGeneration(user.ID, protocol, 1)
+	// 规格放在挑完 Key 之后建：调用方式要等挑中 Key 才知道，而请求形状是跟着它走的。
+	// 建规格失败也要把刚扣的额度退回去。
+	spec, err := buildSpec(r.Context(), body, protocol)
 	if err != nil {
+		refunded := s.store.refund(user.ID, cost)
+		var typed *httpError
+		if errors.As(err, &typed) {
+			typed.quota = &refunded
+			return typed
+		}
 		return err
 	}
 	cred := credential{APIKey: key.APIKey, BaseURL: key.BaseURL, UserAgent: key.UserAgent}
@@ -1470,6 +1516,86 @@ func (s *server) availableModels(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "models": models})
+	return nil
+}
+
+// generationTypes 给创作页用：用户只挑类型，不挑模型。
+// 每行带上这个类型下面有几把启用的 Key、这些 Key 里到底有没有那个默认模型——
+// 管理端把默认模型配错了，用户端当场就能看出来，不用等生图报错。
+func (s *server) generationTypes(w http.ResponseWriter, r *http.Request) error {
+	if _, err := s.requireUser(r); err != nil {
+		return err
+	}
+	types, err := s.store.modelTypes()
+	if err != nil {
+		return err
+	}
+	keys, err := s.store.keys()
+	if err != nil {
+		return err
+	}
+
+	out := []map[string]any{}
+	for _, item := range types {
+		usable, total, supports, known := 0, 0, 0, 0
+		for _, key := range keys {
+			if key.ModelType != item.Type || key.APIKey == "" {
+				continue
+			}
+			total++
+			if !key.Enabled {
+				continue
+			}
+			if key.BalanceValid != nil && !*key.BalanceValid {
+				continue
+			}
+			if key.Balance != nil && *key.Balance <= 0 {
+				continue
+			}
+			usable++
+			if len(key.Models) == 0 {
+				continue
+			}
+			known++
+			if keyHasModel(key, item.DefaultModel) {
+				supports++
+			}
+		}
+		// 一把 Key 都没挂的类型不列出来，用户端只看到空下拉框没意义。
+		if total == 0 {
+			continue
+		}
+		out = append(out, map[string]any{
+			"type":         item.Type,
+			"label":        item.Label,
+			"defaultModel": item.DefaultModel,
+			"multiplier":   item.Multiplier,
+			"keys":         total,
+			"usable":       usable > 0,
+			"modelKnown":   known > 0 && supports > 0,
+		})
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "types": out})
+	return nil
+}
+
+func (s *server) adminSaveType(w http.ResponseWriter, r *http.Request) error {
+	if err := s.requireAdmin(r); err != nil {
+		return err
+	}
+	body, err := readJSON(w, r)
+	if err != nil {
+		return err
+	}
+	multiplier, ok := firstNumber(body["multiplier"])
+	if !ok {
+		return fail(400, "倍率请填数字")
+	}
+	item, err := s.store.saveModelType(r.PathValue("type"), firstString(body["defaultModel"]), multiplier)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "modelType": item})
 	return nil
 }
 

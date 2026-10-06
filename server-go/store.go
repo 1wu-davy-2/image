@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"math"
 	// 签到额度要在区间里随机，用 math/rand/v2；crypto/rand 留给 newID 和加盐。
 	mrand "math/rand/v2"
 	"os"
@@ -60,6 +62,7 @@ type Key struct {
 	ID               string      `json:"id"`
 	Name             string      `json:"name"`
 	Protocol         string      `json:"protocol"`
+	ModelType        string      `json:"modelType"`
 	BaseURL          string      `json:"baseUrl"`
 	APIKey           string      `json:"apiKey"`
 	UserAgent        string      `json:"userAgent"`
@@ -84,6 +87,71 @@ type AvailableModel struct {
 	Available bool   `json:"available"`
 }
 
+// ModelType 是给用户看的生图类型：GPT / GEMINI / GROK。
+// 用户只挑这个，具体模型走 DefaultModel；Multiplier 是扣额度的倍率
+// （稳定版贵一点，比如 1.5 倍）。
+type ModelType struct {
+	Type         string  `json:"type"`
+	Label        string  `json:"label"`
+	DefaultModel string  `json:"defaultModel"`
+	Multiplier   float64 `json:"multiplier"`
+}
+
+// 三个类型是固定的，管理端只能改默认模型和倍率，不能增删。
+var modelTypeList = []ModelType{
+	{Type: "gpt", Label: "GPT", DefaultModel: "gpt-image-2.5"},
+	{Type: "gemini", Label: "GEMINI", DefaultModel: "gemini-2.5-flash-image"},
+	{Type: "grok", Label: "GROK", DefaultModel: "grok-2-image"},
+}
+
+func modelTypeLabel(name string) string {
+	for _, item := range modelTypeList {
+		if item.Type == name {
+			return item.Label
+		}
+	}
+	return ""
+}
+
+func validModelType(name string) bool { return modelTypeLabel(name) != "" }
+
+// RelayBalance 是中转站那边一共还剩多少钱，给顶栏显示用。
+// Keys 是真正报了余额的把数——没查过余额的 Key 不算在里面，所以这个数
+// 只是「已知的那几把」的合计，不是账户全貌。
+//
+// Blurred 为真表示 Total 是编出来的（见 blurBalance），不是真账。
+type RelayBalance struct {
+	Total   float64 `json:"total"`
+	Unit    string  `json:"unit"`
+	Keys    int     `json:"keys"`
+	Blurred bool    `json:"blurred"`
+}
+
+// 余额低于这个数就照实说：账上快没钱的时候得让人知道，不然生图开始报错
+// 还以为是坏了。高于它就只透个「还够用」的印象。
+const balanceBlurFloor = 10.0
+
+// blurBalance 把真实余额换成给非管理员看的那份。
+//
+// 倍数按「用户 + 当天」定死，不是每次请求摇一次：同一个页面刷新两下数字就变，
+// 看着像坏了，反而更让人盯着这个数看。
+func blurBalance(balance RelayBalance, userID string) RelayBalance {
+	if balance.Total < balanceBlurFloor {
+		return balance
+	}
+	seed := fnv.New64a()
+	seed.Write([]byte(userID))
+	seed.Write([]byte(todayShanghai()))
+	// 第二个种子随便给个常数：这里只要结果稳定，不需要密码学上的随机。
+	rng := mrand.New(mrand.NewPCG(seed.Sum64(), 0x9e3779b97f4a7c15))
+	factor := 5 + rng.IntN(6) // 5..10
+
+	out := balance
+	out.Total = math.Round(balance.Total*float64(factor)*100) / 100
+	out.Blurred = true
+	return out
+}
+
 // Settings 里签到额度是个闭区间：每次签到在 [CheckinMin, CheckinMax] 里随机。
 // 两者相等就是固定额度。
 type Settings struct {
@@ -101,10 +169,11 @@ type Checkin struct {
 }
 
 type AdminState struct {
-	Settings    Settings `json:"settings"`
-	Keys        []Key    `json:"keys"`
-	Users       []User   `json:"users"`
-	CheckinDate string   `json:"checkinDate"`
+	Settings    Settings    `json:"settings"`
+	Keys        []Key       `json:"keys"`
+	Users       []User      `json:"users"`
+	ModelTypes  []ModelType `json:"modelTypes"`
+	CheckinDate string      `json:"checkinDate"`
 }
 
 type Store struct {
@@ -218,6 +287,12 @@ CREATE TABLE IF NOT EXISTS checkins (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS checkins_user ON checkins(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS model_types (
+  type          TEXT PRIMARY KEY,
+  default_model TEXT NOT NULL DEFAULT '',
+  multiplier    REAL NOT NULL DEFAULT 1,
+  updated_at    TEXT NOT NULL DEFAULT ''
+);
 INSERT OR IGNORE INTO settings (id) VALUES (1);
 `)
 	if err != nil {
@@ -237,6 +312,7 @@ INSERT OR IGNORE INTO settings (id) VALUES (1);
 		{"models", "TEXT NOT NULL DEFAULT ''"},
 		{"models_updated_at", "TEXT NOT NULL DEFAULT ''"},
 		{"models_error", "TEXT NOT NULL DEFAULT ''"},
+		{"model_type", "TEXT NOT NULL DEFAULT ''"},
 	}); err != nil {
 		return err
 	}
@@ -244,7 +320,44 @@ INSERT OR IGNORE INTO settings (id) VALUES (1);
 	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email_lower) WHERE email_lower <> ''`); err != nil {
 		return err
 	}
-	return s.migrateCheckinRange()
+	if err := s.migrateCheckinRange(); err != nil {
+		return err
+	}
+	return s.migrateModelTypes()
+}
+
+// migrateModelTypes 给生图类型表铺好三行，并把老 Key 按调用方式猜一个类型。
+//
+// 生图类型（GPT / GEMINI / GROK）是给用户看的分组，调用方式还是管请求形状，
+// 两者并存。老库的 Key 只有调用方式，这里按最接近的对应关系猜一次；
+// 猜错了管理端改一下就行，不猜的话这些 Key 会挑不出来，用户直接生不了图。
+func (s *Store) migrateModelTypes() error {
+	for _, item := range modelTypeList {
+		if _, err := s.db.Exec(
+			`INSERT OR IGNORE INTO model_types (type, default_model, multiplier) VALUES (?, ?, 1)`,
+			item.Type, item.DefaultModel,
+		); err != nil {
+			return err
+		}
+	}
+	for protocol := range protocols {
+		if _, err := s.db.Exec(
+			`UPDATE keys SET model_type = ? WHERE model_type = '' AND protocol = ?`,
+			guessModelType(protocol), protocol,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// guessModelType 按调用方式猜一个生图类型。迁移老 Key 时用，管理端新建 Key
+// 没填类型时也用它兜底——宁可猜一个让人去改，也别让这把 Key 直接挑不出来。
+func guessModelType(protocol string) string {
+	if protocol == "gpt" {
+		return "gpt"
+	}
+	return "gemini"
 }
 
 // migrateCheckinRange 把老的固定签到额度搬成区间。
@@ -937,7 +1050,7 @@ func (s *Store) deleteUser(id string) error {
 
 /* ---------- Key ---------- */
 
-const keyColumns = `id, name, protocol, base_url, api_key, user_agent, balance, balance_unit,
+const keyColumns = `id, name, protocol, model_type, base_url, api_key, user_agent, balance, balance_unit,
 	balance_valid, balance_updated_at, balance_error, models, models_updated_at, models_error,
 	enabled, note, last_used_at`
 
@@ -947,7 +1060,7 @@ func scanKey(row interface{ Scan(...any) error }) (Key, error) {
 	var valid sql.NullBool
 	var enabled int
 	var models string
-	err := row.Scan(&key.ID, &key.Name, &key.Protocol, &key.BaseURL, &key.APIKey, &key.UserAgent,
+	err := row.Scan(&key.ID, &key.Name, &key.Protocol, &key.ModelType, &key.BaseURL, &key.APIKey, &key.UserAgent,
 		&balance, &key.BalanceUnit, &valid, &key.BalanceUpdatedAt, &key.BalanceError,
 		&models, &key.ModelsUpdatedAt, &key.ModelsError, &enabled, &key.Note, &key.LastUsedAt)
 	if err != nil {
@@ -993,10 +1106,39 @@ func (s *Store) keyByID(id string) (Key, error) {
 	return scanKey(s.db.QueryRow(`SELECT `+keyColumns+` FROM keys WHERE id = ?`, id))
 }
 
+// relayBalance 把启用中的 Key 的余额加起来。停用的 Key 不算——它已经不参与挑 Key 了，
+// 把钱算进去会让顶栏那个数比实际能用的多。单位不一致时只合计先遇到的那个单位：
+// 把 USD 和 CNY 直接相加得出的是个假数，宁可不显示那么多把。
+func (s *Store) relayBalance() (RelayBalance, bool) {
+	list, err := s.keys()
+	if err != nil {
+		return RelayBalance{}, false
+	}
+	var out RelayBalance
+	for _, key := range list {
+		if !key.Enabled || key.Balance == nil {
+			continue
+		}
+		unit := key.BalanceUnit
+		if unit == "" {
+			unit = "USD"
+		}
+		if out.Keys == 0 {
+			out.Unit = unit
+		} else if unit != out.Unit {
+			continue
+		}
+		out.Total += *key.Balance
+		out.Keys++
+	}
+	return out, out.Keys > 0
+}
+
 type KeyInput struct {
 	ID        string
 	Name      string
 	Protocol  string
+	ModelType string
 	BaseURL   string
 	APIKey    string
 	UserAgent string
@@ -1010,6 +1152,13 @@ func (s *Store) saveKey(in KeyInput) (Key, error) {
 	if name == "" || len([]rune(name)) > 40 {
 		return Key{}, fail(400, "请填写 40 字以内的名称")
 	}
+	// 没填就按调用方式猜一个。老的调用方（管理端页面还没更新时）不会带这个字段，
+	// 直接打回的话那把 Key 就存不进去了。猜错了管理端改一下就是。
+	if in.ModelType == "" {
+		in.ModelType = guessModelType(in.Protocol)
+	} else if !validModelType(in.ModelType) {
+		return Key{}, fail(400, "不认识的生图类型")
+	}
 	note := []rune(strings.TrimSpace(in.Note))
 	if len(note) > 200 {
 		note = note[:200]
@@ -1020,10 +1169,10 @@ func (s *Store) saveKey(in KeyInput) (Key, error) {
 
 	if in.ID == "" {
 		id := newID()
-		if _, err := s.db.Exec(`INSERT INTO keys (id, name, protocol, base_url, api_key, user_agent, balance,
+		if _, err := s.db.Exec(`INSERT INTO keys (id, name, protocol, model_type, base_url, api_key, user_agent, balance,
 			balance_unit, balance_valid, balance_updated_at, balance_error, enabled, note, last_used_at, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', NULL, '', '', ?, ?, 0, ?)`,
-			id, name, in.Protocol, in.BaseURL, in.APIKey, in.UserAgent, in.Balance, boolToInt(in.Enabled), string(note), s.now()); err != nil {
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'USD', NULL, '', '', ?, ?, 0, ?)`,
+			id, name, in.Protocol, in.ModelType, in.BaseURL, in.APIKey, in.UserAgent, in.Balance, boolToInt(in.Enabled), string(note), s.now()); err != nil {
 			return Key{}, err
 		}
 		if in.APIKey == "" {
@@ -1051,9 +1200,9 @@ func (s *Store) saveKey(in KeyInput) (Key, error) {
 		valid = nil
 		balanceError = ""
 	}
-	if _, err := s.db.Exec(`UPDATE keys SET name = ?, protocol = ?, base_url = ?, api_key = ?, user_agent = ?,
+	if _, err := s.db.Exec(`UPDATE keys SET name = ?, protocol = ?, model_type = ?, base_url = ?, api_key = ?, user_agent = ?,
 		balance = ?, balance_valid = ?, balance_error = ?, enabled = ?, note = ? WHERE id = ?`,
-		name, in.Protocol, in.BaseURL, apiKey, in.UserAgent, in.Balance, boolPtrToInt(valid), balanceError,
+		name, in.Protocol, in.ModelType, in.BaseURL, apiKey, in.UserAgent, in.Balance, boolPtrToInt(valid), balanceError,
 		boolToInt(in.Enabled), string(note), in.ID); err != nil {
 		return Key{}, err
 	}
@@ -1221,10 +1370,179 @@ func (s *Store) pickKey(protocol string) (Key, error) {
 	return Key{}, fail(400, "没有可用的生图 Key。请在管理端添加，或确认剩余余额大于 0。")
 }
 
+// modelTypes 按固定顺序返回三个类型，没铺过的行按默认值补上，
+// 保证管理端和用户端看到的永远是三行。
+func (s *Store) modelTypes() ([]ModelType, error) {
+	rows, err := s.db.Query(`SELECT type, default_model, multiplier FROM model_types`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	stored := map[string]ModelType{}
+	for rows.Next() {
+		var item ModelType
+		if err := rows.Scan(&item.Type, &item.DefaultModel, &item.Multiplier); err != nil {
+			return nil, err
+		}
+		stored[item.Type] = item
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]ModelType, 0, len(modelTypeList))
+	for _, fallback := range modelTypeList {
+		item := fallback
+		if saved, ok := stored[fallback.Type]; ok {
+			item.DefaultModel = saved.DefaultModel
+			item.Multiplier = saved.Multiplier
+		}
+		if item.Multiplier <= 0 {
+			item.Multiplier = 1
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func (s *Store) modelType(name string) (ModelType, error) {
+	if !validModelType(name) {
+		return ModelType{}, fail(400, "不认识的生图类型")
+	}
+	list, err := s.modelTypes()
+	if err != nil {
+		return ModelType{}, err
+	}
+	for _, item := range list {
+		if item.Type == name {
+			return item, nil
+		}
+	}
+	return ModelType{}, fail(400, "不认识的生图类型")
+}
+
+func (s *Store) saveModelType(name, defaultModel string, multiplier float64) (ModelType, error) {
+	if !validModelType(name) {
+		return ModelType{}, fail(400, "不认识的生图类型")
+	}
+	defaultModel = strings.TrimSpace(defaultModel)
+	if defaultModel != "" && !modelRe.MatchString(defaultModel) {
+		return ModelType{}, fail(400, "默认模型名不合法")
+	}
+	if multiplier < 0.1 || multiplier > 100 {
+		return ModelType{}, fail(400, "倍率请填 0.1 到 100 之间")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec(
+		`UPDATE model_types SET default_model = ?, multiplier = ?, updated_at = ? WHERE type = ?`,
+		defaultModel, multiplier, s.now(), name,
+	); err != nil {
+		return ModelType{}, err
+	}
+	return s.modelType(name)
+}
+
+// pickKeyForType 按生图类型挑 Key。类型下面可能挂着好几把不同调用方式的 Key，
+// 挑中那把的 protocol 决定这次请求走什么形状。
+//
+// 分三档挑，档内还是按余额和最近最少用排：
+//   1. 模型列表里确实有这个默认模型的
+//   2. 还没拉过模型列表的（不知道支不支持，不能用「不知道」当理由排除掉）
+//   3. 拉了列表但里面没有这个模型的
+// 第三档留着不删是为了兜底：模型列表可能是旧的，硬排除会让用户直接生不了图。
+// 但只要有前两档，就先不用它——中转站按分组给模型，配了 Key 不代表这把 Key 的
+// 账号支持这个模型，挑错了用户收到的就是「not supported by any configured account」
+// 这种看不懂的报错。
+func (s *Store) pickKeyForType(modelType, defaultModel string) (Key, error) {
+	all, err := s.keys()
+	if err != nil {
+		return Key{}, err
+	}
+	var has, unknown, missing []Key
+	for _, key := range all {
+		if !key.Enabled || key.ModelType != modelType || key.APIKey == "" {
+			continue
+		}
+		if key.BalanceValid != nil && !*key.BalanceValid {
+			continue
+		}
+		// 余额 0 的不要，未知的留着。
+		if key.Balance != nil && *key.Balance <= 0 {
+			continue
+		}
+		switch {
+		case len(key.Models) == 0:
+			unknown = append(unknown, key)
+		case defaultModel != "" && keyHasModel(key, defaultModel):
+			has = append(has, key)
+		default:
+			missing = append(missing, key)
+		}
+	}
+
+	// 余额已知的优先，然后余额大的、最近没怎么用的。
+	byBalance := func(a, b Key) bool {
+		if (a.Balance == nil) != (b.Balance == nil) {
+			return b.Balance == nil
+		}
+		if a.Balance != nil && *a.Balance != *b.Balance {
+			return *a.Balance > *b.Balance
+		}
+		return a.LastUsedAt < b.LastUsedAt
+	}
+	for _, group := range [][]Key{has, unknown, missing} {
+		sortKeys(group, byBalance)
+		if len(group) > 0 {
+			return group[0], nil
+		}
+	}
+	label := modelTypeLabel(modelType)
+	if label == "" {
+		label = modelType
+	}
+	return Key{}, fail(400, "「"+label+"」下面没有可用的生图 Key。请在管理端把 Key 挂到这个类型上，或确认它的余额大于 0。")
+}
+
+func keyHasModel(key Key, model string) bool {
+	for _, item := range key.Models {
+		if item.ID == model {
+			return true
+		}
+	}
+	return false
+}
+
 // reserveGeneration 扣额度并锁定一把 Key。units 是消耗次数（批量按条目数算）。
 func (s *Store) reserveGeneration(userID, protocol string, units int) (Key, int, int, error) {
+	return s.reserve(userID, 1, units, func() (Key, error) { return s.pickKey(protocol) })
+}
+
+// reserveForType 按生图类型扣额度并锁定一把 Key，返回那把 Key（它的 protocol
+// 决定请求形状）和这个类型的设置（默认模型、倍率）。
+func (s *Store) reserveForType(userID, modelType string, units int) (Key, ModelType, int, int, error) {
+	item, err := s.modelType(modelType)
+	if err != nil {
+		return Key{}, ModelType{}, 0, 0, err
+	}
+	key, cost, quota, err := s.reserve(userID, item.Multiplier, units, func() (Key, error) {
+		return s.pickKeyForType(modelType, item.DefaultModel)
+	})
+	if err != nil {
+		return Key{}, ModelType{}, 0, 0, err
+	}
+	return key, item, cost, quota, nil
+}
+
+// reserve 是扣额度那套动作的公共部分：查用户、算费用、挑 Key、扣。
+//
+// cost = 每次消耗 × 倍率 × 次数，向上取整。宁可多扣一点也不少扣——1.5 倍的
+// 模型按 1 倍收，倍率就等于没有；而且额度是整数，不取整根本扣不动。
+func (s *Store) reserve(userID string, multiplier float64, units int, pick func() (Key, error)) (Key, int, int, error) {
 	if units < 1 {
 		units = 1
+	}
+	if multiplier <= 0 {
+		multiplier = 1
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1240,7 +1558,10 @@ func (s *Store) reserveGeneration(userID, protocol string, units int) (Key, int,
 	if err != nil {
 		return Key{}, 0, 0, err
 	}
-	cost := settings.GenerateCost * units
+	cost := int(math.Ceil(float64(settings.GenerateCost) * multiplier * float64(units)))
+	if cost < 1 {
+		cost = 1
+	}
 	if user.Quota < cost {
 		hint := "额度不足，可以先签到领取。"
 		if user.LastCheckinDate == todayShanghai() {
@@ -1248,7 +1569,7 @@ func (s *Store) reserveGeneration(userID, protocol string, units int) (Key, int,
 		}
 		return Key{}, 0, 0, fail(402, hint)
 	}
-	key, err := s.pickKey(protocol)
+	key, err := pick()
 	if err != nil {
 		return Key{}, 0, 0, err
 	}
@@ -1290,7 +1611,14 @@ func (s *Store) adminState() (AdminState, error) {
 	if err != nil {
 		return AdminState{}, err
 	}
-	return AdminState{Settings: settings, Keys: keys, Users: users, CheckinDate: todayShanghai()}, nil
+	types, err := s.modelTypes()
+	if err != nil {
+		return AdminState{}, err
+	}
+	return AdminState{
+		Settings: settings, Keys: keys, Users: users,
+		ModelTypes: types, CheckinDate: todayShanghai(),
+	}, nil
 }
 
 func boolToInt(value bool) int {

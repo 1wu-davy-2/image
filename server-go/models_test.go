@@ -2,11 +2,20 @@ package main
 
 import "testing"
 
+// 生图类型是必填的，测试里按调用方式猜一个够用的对应关系。
+func typeForProtocol(protocol string) string {
+	if protocol == "gpt" {
+		return "gpt"
+	}
+	return "gemini"
+}
+
 func seedKey(t *testing.T, store *Store, name, protocol string, balance *float64, valid *bool, enabled bool) Key {
 	t.Helper()
 	key, err := store.saveKey(KeyInput{
-		Name: name, Protocol: protocol, BaseURL: "https://uuapi.io/v1",
-		APIKey: "sk-test-" + name, Balance: balance, Enabled: enabled,
+		Name: name, Protocol: protocol, ModelType: typeForProtocol(protocol),
+		BaseURL: "https://uuapi.io/v1",
+		APIKey:  "sk-test-" + name, Balance: balance, Enabled: enabled,
 	})
 	if err != nil {
 		t.Fatalf("建 Key 失败：%v", err)
