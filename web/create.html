@@ -40,7 +40,7 @@
         <div class="page-head">
           <p class="eyebrow">画坊</p>
           <h2>把愿望画成图</h2>
-          <p>挑一个生图类型，写下画面。模型由管理端定，生成的图会自动收进作品集。</p>
+          <p>挑一个生图类型，写下画面。模型默认由管理端定，也可以自己换。</p>
         </div>
 
         <div class="tabs" role="tablist" aria-label="创作方式">
@@ -62,6 +62,9 @@
 
               <label for="modelType">生图类型</label>
               <select id="modelType" name="modelType"></select>
+
+              <label for="model">模型</label>
+              <select id="model" name="model"></select>
               <p id="typeHint" class="hint"></p>
 
               <label for="prompt">描述</label>
@@ -191,7 +194,7 @@
           <div class="split">
             <div>
               <label for="batchModel">模型</label>
-              <input id="batchModel" value="gemini-2.5-flash-image" spellcheck="false" />
+              <select id="batchModel"></select>
             </div>
             <div>
               <label for="batchSize">分辨率</label>

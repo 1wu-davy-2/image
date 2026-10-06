@@ -21,6 +21,51 @@ function setStatus(message, isError) {
   status.classList.toggle("error", Boolean(isError));
 }
 
+/* ---------- 放大查看 ---------- */
+
+// 点图放大，而不是跳新标签页：翻作品的时候一跳走，回来得重新找看到哪儿了。
+// 点图、点背景、按 Esc 都关掉。
+let lightbox = null;
+
+function closeLightbox() {
+  if (!lightbox) return;
+  lightbox.remove();
+  lightbox = null;
+  document.removeEventListener("keydown", onLightboxKey);
+}
+
+function onLightboxKey(event) {
+  if (event.key === "Escape") closeLightbox();
+}
+
+function openLightbox(src, caption) {
+  closeLightbox();
+  lightbox = document.createElement("div");
+  lightbox.className = "lightbox";
+  lightbox.setAttribute("role", "dialog");
+  lightbox.setAttribute("aria-modal", "true");
+  lightbox.setAttribute("aria-label", caption || "放大查看");
+
+  const img = document.createElement("img");
+  img.src = src;
+  img.alt = caption || "";
+  lightbox.append(img);
+
+  // 图下面的说明。空着就不占地方。
+  if (caption) {
+    const note = document.createElement("p");
+    note.className = "lightbox-caption";
+    note.textContent = caption;
+    lightbox.append(note);
+  }
+
+  // 点图本身不该关——用户多半是想凑近看，不是想退出。
+  img.addEventListener("click", (event) => event.stopPropagation());
+  lightbox.addEventListener("click", closeLightbox);
+  document.addEventListener("keydown", onLightboxKey);
+  document.body.append(lightbox);
+}
+
 function actionButton(label, handler, extra = "") {
   const button = document.createElement("button");
   button.type = "button";
@@ -83,16 +128,29 @@ function workCard(item) {
   frame.className = "work-frame";
   if (item.images.length) {
     const full = api(`/api/generations/${encodeURIComponent(item.id)}/images/${item.images[0].position}`);
-    const link = document.createElement("a");
-    link.href = full;
-    link.target = "_blank";
-    link.rel = "noopener";
     const img = document.createElement("img");
     img.src = full;
     img.alt = item.prompt;
     img.loading = "lazy";
-    link.append(img);
-    frame.append(link);
+    if (isWorks) {
+      // 公开作品是「逛」：点开放大，别把人从这一页带走，回来还得重新找看到哪儿了。
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "work-zoom";
+      button.title = "放大查看";
+      button.setAttribute("aria-label", "放大查看");
+      button.append(img);
+      button.addEventListener("click", () => openLightbox(full, item.prompt));
+      frame.append(button);
+    } else {
+      // 作品集是「管」：多半想把原图拿到手，还是跳新标签页。
+      const link = document.createElement("a");
+      link.href = full;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.append(img);
+      frame.append(link);
+    }
   }
   if (item.isPublic) {
     const badge = document.createElement("span");

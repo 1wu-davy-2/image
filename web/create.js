@@ -24,6 +24,7 @@ const GPT_RATIOS = { "1:1": [1, 1], "4:3": [4, 3], "3:4": [3, 4], "16:9": [16, 9
 
 const form = document.querySelector("#form");
 const modelType = document.querySelector("#modelType");
+const model = document.querySelector("#model");
 const typeHint = document.querySelector("#typeHint");
 const prompt = document.querySelector("#prompt");
 const gptRatio = document.querySelector("#gptRatio");
@@ -71,9 +72,10 @@ function showTab(name) {
   for (const panel of document.querySelectorAll("[data-panel]")) {
     panel.classList.toggle("hidden", panel.dataset.panel !== name);
   }
-  // 批量列表等真的切过去再拉，省得每次打开创作页都空跑一趟上游。
+  // 批量列表和模型列表都等真的切过去再拉，省得每次打开创作页都空跑一趟上游。
   if (name === "batch" && !batchLoaded) {
     batchLoaded = true;
+    loadBatchModels();
     loadBatches({ quiet: true });
   }
 }
@@ -85,8 +87,9 @@ for (const tab of tabs) {
 function loadPrefs() {
   try {
     const saved = JSON.parse(localStorage.getItem(prefsKey) || "{}");
-    // 类型要等 /api/types 回来才知道有哪些，先记着，fillTypes 里再挑。
+    // 类型和模型都要等 /api/types 回来才知道有哪些，先记着，fillTypes 里再挑。
     if (saved.type) modelType.dataset.prefer = saved.type;
+    if (saved.model) model.dataset.prefer = saved.model;
     if (saved.quality) quality.value = saved.quality;
     if (saved.gptRatio) gptRatio.value = saved.gptRatio;
     if (saved.gptResolution) gptResolution.value = saved.gptResolution;
@@ -106,6 +109,7 @@ function loadPrefs() {
 function savePrefs() {
   localStorage.setItem(prefsKey, JSON.stringify({
     type: modelType.value,
+    model: model.value,
     quality: quality.value,
     gptRatio: gptRatio.value,
     gptResolution: gptResolution.value,
@@ -121,8 +125,50 @@ function currentType() {
   return generationTypes.find((item) => item.type === modelType.value) || null;
 }
 
+// 下拉里带上倍率：同一个类型下面各模型的价不一样，挑之前就得看得见。
+// 补进来的默认模型没有倍率数据（Key 还没拉到它），那就只写名字——
+// 不写等于「不知道」，写 1x 等于「确定不加价」，两回事。
+function modelLabel(entry, item) {
+  const name = entry.id === item.defaultModel ? `${entry.name}（默认）` : entry.name;
+  return entry.multiplier > 0 ? `${name} · ${entry.multiplier}x` : name;
+}
+
+// 模型列表是这个类型下面各把 Key 拉到的并集。默认选中管理端配的那个，
+// 用户不动它就是「走系统默认」；想换再自己挑。
+function fillModels() {
+  const item = currentType();
+  const prefer = model.dataset.prefer || "";
+  model.replaceChildren();
+  if (!item) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "先选生图类型";
+    option.disabled = true;
+    model.append(option);
+    return;
+  }
+  const list = (item.models || []).slice();
+  // 默认模型可能不在列表里（Key 还没拉到，或者模型列表是旧的），补进去，
+  // 不然默认值选不中，用户看到的是另一个模型。
+  if (item.defaultModel && !list.some((entry) => entry.id === item.defaultModel)) {
+    list.unshift({ id: item.defaultModel, name: item.defaultModel });
+  }
+  for (const entry of list) {
+    const option = document.createElement("option");
+    option.value = entry.id;
+    option.textContent = modelLabel(entry, item);
+    model.append(option);
+  }
+  const known = list.find((entry) => entry.id === prefer);
+  model.value = known ? prefer : item.defaultModel || (list[0] && list[0].id) || "";
+  delete model.dataset.prefer;
+  typeHint.textContent = typeLine();
+}
+
 function fillTypes() {
-  const prefer = modelType.dataset.prefer || "";
+  // 当前选中的优先，其次才是上次存下来的偏好。不认当前值的话，用户刚换完类型、
+  // change 处理器再调一次这里，就会把他换的那个又顶回第一个类型。
+  const prefer = modelType.value || modelType.dataset.prefer || "";
   modelType.replaceChildren();
   for (const item of generationTypes) {
     const option = document.createElement("option");
@@ -138,27 +184,50 @@ function fillTypes() {
     option.disabled = true;
     modelType.append(option);
   }
-  const known = generationTypes.find((item) => item.type === prefer && item.usable);
+  // 上次选的那个要是还在（而且可用）就接着用它。不可用说明它下面的 Key 出了问题，
+  // 换个能用的，别让用户停在上面生不了图。
+  const known = generationTypes.find((item) => item.type === prefer);
   const fallback = generationTypes.find((item) => item.usable) || generationTypes[0];
-  if (known) modelType.value = known.type;
+  if (known && known.usable) modelType.value = known.type;
   else if (fallback) modelType.value = fallback.type;
   delete modelType.dataset.prefer;
 
-  typeHint.textContent = typeLine();
+  // 提示归 fillModels 管：它才知道最后选中的是哪个模型，而提示里要写这个模型扣多少。
+  fillModels();
 }
 
-// 用户不挑模型，所以这里要把他实际会用到的模型写出来——出问题描述得清楚。
+// 服务端算的是 每次消耗 × 类型倍率 × 模型倍率（向上取整），这里跟着算一遍给用户看。
+// 改一边记得改另一边。
+function costLine(item) {
+  const chosen = model.value || item.defaultModel;
+  const entry = (item.models || []).find((m) => m.id === chosen);
+  // /api/types 已经把每个模型的倍率和算好的 cost 带回来了，优先用它。
+  if (entry && typeof entry.cost === "number") return entry.cost;
+  const rate = entry && entry.multiplier > 0 ? entry.multiplier : 1;
+  const cost = Math.ceil((window.Darkroom.cost || 1) * item.multiplier * rate);
+  return cost < 1 ? 1 : cost;
+}
+
+// 用户不挑模型也能用，所以这里要把他实际会用到的模型和这次扣多少写出来——
+// 出问题描述得清楚。
 function typeLine() {
   const item = currentType();
   if (!item) return "管理端还没配置生图类型，先去「API 管理」挂一把 Key。";
-  const cost = Math.ceil((window.Darkroom.cost || 1) * item.multiplier);
-  const money = item.multiplier === 1 ? `每次消耗 ${cost} 额度` : `每次消耗 ${cost} 额度（${item.multiplier} 倍）`;
+
+  const chosen = model.value || item.defaultModel;
+  const entry = (item.models || []).find((m) => m.id === chosen);
+  const rate = entry && entry.multiplier > 0 ? entry.multiplier : 1;
+  const factor = item.multiplier * rate;
+  const cost = costLine(item);
+  const money = factor === 1 ? `每次消耗 ${cost} 额度` : `每次消耗 ${cost} 额度（${factor} 倍）`;
+
   if (!item.usable) return `${money}。这个类型下面没有可用的 Key，先去管理端看看余额和状态。`;
-  const model = item.defaultModel ? `模型 ${item.defaultModel}` : "管理端还没给这个类型配默认模型";
-  if (item.defaultModel && !item.modelKnown) {
-    return `${money}。${model}——这个类型的 Key 还没拉到这个模型，生图可能会失败。`;
+  if (!item.defaultModel) return `${money}。管理端还没给这个类型配默认模型，自己选一个。`;
+  if (chosen === item.defaultModel) {
+    if (!item.modelKnown) return `${money}。模型 ${chosen}——这个类型的 Key 还没拉到这个模型，生图可能会失败。`;
+    return `${money}。模型 ${chosen}。`;
   }
-  return `${money}。${model}。`;
+  return `${money}。模型 ${chosen}（不是默认的 ${item.defaultModel}）。`;
 }
 
 async function loadTypes() {
@@ -288,6 +357,8 @@ async function onSubmit(event) {
   // 两套尺寸字段都发：调用方式是服务端挑完 Key 才知道的，那边取用得上的那套。
   const payload = {
     type: item.type,
+    // 模型可以不选——不选（或选的就是默认那个）就不发，让服务端用它配的默认值。
+    model: model.value && model.value !== item.defaultModel ? model.value : "",
     prompt: text,
     mode,
     size: selectedSize(),
@@ -325,7 +396,7 @@ async function onSubmit(event) {
     if (!response.ok || !data.ok) throw new Error(data.error || `请求失败（${response.status}）`);
     showResult({
       prompt: text,
-      model: item.defaultModel,
+      model: model.value || item.defaultModel,
       sizeLabel,
       channel: data.channel,
       taskId: data.taskId || "",
@@ -344,8 +415,12 @@ async function onSubmit(event) {
 }
 
 form.addEventListener("change", (event) => {
-  // 换类型要换一套尺寸控件，顺手把那行提示也刷新。
-  if (event.target === modelType) fillTypes();
+  // 换类型要换模型下拉和一套尺寸控件，顺手把那行提示也刷新。
+  if (event.target === modelType) {
+    fillTypes();
+  } else if (event.target === model) {
+    typeHint.textContent = typeLine();
+  }
   syncFields();
   savePrefs();
 });
@@ -382,6 +457,65 @@ function batchSummary(batch) {
   const state = String(batch?.status || "");
   const counts = batch?.item_count ?? batch?.request_counts?.total ?? batch?.outputs;
   return [state, counts === undefined ? "" : `${counts} 条`].filter(Boolean).join(" · ") || "未知状态";
+}
+
+// 批量模型的下拉只能选中转站认的模型，所以列表得问它要（/api/batches/models 透传过去）。
+// 拉不到就禁用并把原因写在下拉里——留个空框让用户乱填，错的要等提交才知道。
+async function loadBatchModels() {
+  const prefer = batchModel.value;
+  setBatchModelOptions([{ value: "", text: "正在读取模型…", disabled: true }], true);
+  try {
+    const response = await fetch(api("/api/batches/models"), { credentials: "include" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || `读不到模型列表（${response.status}）`);
+    const list = batchModelEntries(data.result);
+    if (!list.length) throw new Error("中转站没返回可用的批量模型。");
+    setBatchModelOptions(list.map((entry) => ({
+      value: entry.id,
+      text: entry.name === entry.id ? entry.id : `${entry.name}（${entry.id}）`,
+    })));
+    // 上次选的那个还在就接着用，不然退回第一个。
+    if (list.some((entry) => entry.id === prefer)) batchModel.value = prefer;
+  } catch (error) {
+    setBatchModelOptions([{ value: "", text: error.message || "读不到模型列表", disabled: true }], true);
+  }
+}
+
+function setBatchModelOptions(options, disabled = false) {
+  batchModel.replaceChildren();
+  for (const option of options) {
+    const node = document.createElement("option");
+    node.value = option.value;
+    node.textContent = option.text;
+    if (option.disabled) node.disabled = true;
+    batchModel.append(node);
+  }
+  batchModel.disabled = disabled;
+}
+
+// 上游 /models 的形状不固定，跟 batchEntries 一样把可能的外壳都认一遍。
+function batchModelEntries(result) {
+  let list = Array.isArray(result) ? result : null;
+  if (!list) {
+    for (const key of ["data", "models", "items"]) {
+      if (result && Array.isArray(result[key])) {
+        list = result[key];
+        break;
+      }
+    }
+  }
+  if (!list) return [];
+  const out = [];
+  const seen = new Set();
+  for (const entry of list) {
+    const text = typeof entry === "string" ? entry : "";
+    const id = text || String(entry?.id || entry?.model || entry?.name || "");
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const name = text || String(entry?.display_name || entry?.displayName || entry?.name || id);
+    out.push({ id, name });
+  }
+  return out;
 }
 
 function renderBatches(result) {
@@ -468,7 +602,7 @@ async function submitBatch() {
   }
   const chosen = batchModel.value.trim();
   if (!chosen) {
-    setBatchStatus("请填写模型名。", true);
+    setBatchStatus("还没有可选的模型——下拉里写着原因，点「刷新列表」重试。", true);
     return;
   }
   batchBusy = true;
@@ -502,7 +636,11 @@ async function submitBatch() {
 }
 
 batchSubmit.addEventListener("click", submitBatch);
-batchRefresh.addEventListener("click", () => loadBatches());
+// 刷新也带上模型列表：刚在管理端挂完批量 Key 的人，多半是在这儿点。
+batchRefresh.addEventListener("click", () => {
+  loadBatchModels();
+  loadBatches();
+});
 
 loadPrefs();
 // 类型是管理端配的，得等 /api/types 回来才知道。先按空的重画一次占位，

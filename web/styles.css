@@ -289,6 +289,8 @@ button:focus-visible, .btn:focus-visible { outline: 2px solid color-mix(in oklab
 /* ---------- 状态与徽章 ---------- */
 
 .status { min-height: 1.5em; margin: 12px 0 0; font-size: 14px; color: var(--ink-muted); }
+/* 没话说的时候别占着位置：留一个 1.5em 高的空行，看着像排版坏了。 */
+.status:empty { display: none; }
 .status.error { color: var(--cinnabar); }
 
 .badge {
@@ -308,13 +310,19 @@ button:focus-visible, .btn:focus-visible { outline: 2px solid color-mix(in oklab
   background: color-mix(in oklab, var(--cinnabar) 12%, var(--mist)); color: var(--cinnabar); }
 .sub { margin-top: 3px; font-size: 12px; color: var(--ink-subtle); overflow-wrap: anywhere; }
 .bad-text { color: var(--cinnabar); font-size: 12px; margin-top: 3px; }
+/* 审计的「详情」那一列最容易长（上游的报错原文都能塞进去），限个宽再截断，
+   完整内容挂在 title 上，悬停能看全。 */
+.audit-detail { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---------- 表格 ---------- */
 
 .table-wrap { overflow-x: auto; margin-top: 4px; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid color-mix(in oklab, var(--line) 70%, transparent); vertical-align: middle; font-size: 14px; }
-th { color: var(--ink-muted); font-weight: 500; font-size: 13px; }
+/* 表头不折行：「生图类型」这种四个字的表头一窄就会被拆成「生图类 / 型」。
+   值那边同理，只给短字段加，长文本（模型列表、备注）还是要能折。 */
+th { color: var(--ink-muted); font-weight: 500; font-size: 13px; white-space: nowrap; }
+.nowrap { white-space: nowrap; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover td { background: color-mix(in oklab, var(--rice) 35%, transparent); }
 .money { font-variant-numeric: tabular-nums; }
@@ -453,6 +461,58 @@ details.docs summary:hover { color: var(--ink); }
   border-top: 1px solid color-mix(in oklab, var(--line) 70%, transparent);
 }
 .dialog .status { margin: 8px 0 0; }
+
+/* 长表单用的弹窗：比签到记录那个宽，内容超出时只有中间那段滚，
+   头和脚钉住——不然「保存」会被顶到屏幕外面去。
+   display 必须挂在 [open] 上：<dialog> 没开时靠 UA 样式表的 display:none 藏起来，
+   直接写 .dialog-form { display: flex } 会把它盖掉，弹窗关着也一直在页面上摊着。 */
+.dialog-form {
+  width: min(620px, calc(100vw - 40px));
+  max-height: min(88vh, 860px);
+}
+.dialog-form[open] { display: flex; flex-direction: column; }
+.dialog-body { overflow-y: auto; margin: 0 -6px; padding: 0 6px; }
+.dialog-form .dialog-foot { margin-top: 0; }
+.dialog-form .dialog-foot .status { margin: 0; }
+
+/* 从右边拉出来的抽屉。还是 <dialog>，所以遮罩、Esc 关闭这些白拿；
+   只是把默认的居中改成贴右、占满整高。 */
+.dialog-drawer {
+  width: min(460px, calc(100vw - 40px));
+  height: 100dvh;
+  max-height: 100dvh;
+  margin: 0 0 0 auto;
+  border-radius: 0;
+  border-right: 0;
+  padding: 22px 24px;
+}
+.dialog-drawer[open] {
+  display: flex;
+  flex-direction: column;
+  animation: drawer-in 0.18s var(--ease);
+}
+.dialog-drawer .dialog-body { flex: 1; }
+.dialog-drawer .dialog-foot { margin-top: 0; }
+.dialog-drawer .dialog-foot .status { margin: 0; }
+@keyframes drawer-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+/* 抽屉里一行一个模型：名字在左，倍率输入和保存在右。 */
+.rate-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 2px;
+  border-bottom: 1px solid color-mix(in oklab, var(--line) 60%, transparent);
+}
+.rate-row:last-child { border-bottom: 0; }
+.rate-name { flex: 1; min-width: 0; }
+.rate-name b { display: block; font-weight: 500; font-size: 14px; overflow-wrap: anywhere; }
+.rate-name span { display: block; margin-top: 2px; font-size: 12px; color: var(--ink-subtle); }
+.rate-row input { width: 84px; }
+.rate-row .bad-text { margin: 0; }
 
 .log-list { max-height: 46vh; overflow-y: auto; margin-top: 12px; }
 .log-row {
@@ -831,6 +891,49 @@ body.studio-page .shell { position: relative; z-index: 1; }
   background: var(--rice) center / cover no-repeat;
 }
 .work-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* 图本身是个按钮（点了放大），所以把按钮的默认样子清干净，
+   让它跟原来那个 <a> 长得一模一样。 */
+.work-zoom {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: zoom-in;
+}
+.work-zoom:focus-visible { outline: 2px solid var(--cyan-deep); outline-offset: -2px; }
+
+/* ---------- 放大查看 ---------- */
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 4vh 4vw;
+  background: color-mix(in oklab, #1b1a17 82%, transparent);
+  cursor: zoom-out;
+}
+.lightbox img {
+  max-width: 100%;
+  max-height: 82vh;
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 60px rgb(0 0 0 / 0.45);
+  cursor: default;
+}
+.lightbox-caption {
+  max-width: min(760px, 100%);
+  margin: 0;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.6;
+  color: color-mix(in oklab, var(--rice) 88%, transparent);
+}
 .work-badge {
   position: absolute;
   top: 10px;
