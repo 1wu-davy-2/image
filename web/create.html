@@ -18,6 +18,7 @@
           <p class="eyebrow">UU API · Image</p>
           <h1>暗房</h1>
         </div>
+        <nav class="nav top-nav" id="topNav" aria-label="画坊菜单"></nav>
         <div class="top-trailing" id="userMenu"></div>
       </div>
       <div class="motif" aria-hidden="true">
@@ -39,7 +40,7 @@
         <div class="page-head">
           <p class="eyebrow">画坊</p>
           <h2>把愿望画成图</h2>
-          <p>选一种调用方式，写下画面。生成的图会自动收进作品集。</p>
+          <p>挑一个生图类型，写下画面。模型由管理端定，生成的图会自动收进作品集。</p>
         </div>
 
         <div class="tabs" role="tablist" aria-label="创作方式">
@@ -59,17 +60,9 @@
                 <label><input type="radio" name="mode" value="edit" /> 图生图</label>
               </div>
 
-              <label for="protocol">调用方式</label>
-              <select id="protocol" name="protocol">
-                <option value="gpt">GPT 生图</option>
-                <option value="nano">Nano Banana 香蕉生图</option>
-                <option value="gemini-official">GEMINI官方直连-带生图</option>
-              </select>
-              <p id="protocolHint" class="hint"></p>
-
-              <label for="model">模型</label>
-              <select id="model" name="model"></select>
-              <input id="customModel" name="customModel" class="hidden" placeholder="填写模型名" spellcheck="false" />
+              <label for="modelType">生图类型</label>
+              <select id="modelType" name="modelType"></select>
+              <p id="typeHint" class="hint"></p>
 
               <label for="prompt">描述</label>
               <textarea id="prompt" name="prompt" rows="6" required placeholder="冬夜里的灯塔，海面翻着白浪，胶片颗粒，窗口是暖色的。"></textarea>

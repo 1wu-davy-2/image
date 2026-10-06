@@ -1,9 +1,13 @@
 const PROTOCOL_LABEL = {
-  gpt: "GPT",
+  gpt: "GPT 生图",
   nano: "香蕉",
   "gemini-official": "官方直连",
   "gemini-batch": "批量",
 };
+
+// 生图类型是给用户挑的那一项，跟调用方式是两回事：类型管分组和倍率，
+// 调用方式管请求怎么发。三个类型固定，管理端只能改默认模型和倍率。
+const TYPE_LABEL = { gpt: "GPT", gemini: "GEMINI", grok: "GROK" };
 
 // 所有请求都从这里过，方便整体指向另一个后端。见 config.js。
 const API_BASE = String(window.DARKROOM_API || "").replace(/\/+$/, "");
@@ -17,11 +21,14 @@ const userStatus = document.querySelector("#userStatus");
 const keyRows = document.querySelector("#keyRows");
 const userRows = document.querySelector("#userRows");
 
-let state = { keys: [], users: [], settings: { checkinMin: 5, checkinMax: 5, generateCost: 1 } };
+let state = {
+  keys: [], users: [], modelTypes: [],
+  settings: { checkinMin: 5, checkinMax: 5, generateCost: 1 },
+};
 
-// 三块内容装在一个页面里，靠 hash 切。这样刷新和前进后退都能回到原来那一页，
-// 也不用为了三个菜单项多开三个 HTML。
-const PANELS = ["users", "keys", "checkin"];
+// 四块内容装在一个页面里，靠 hash 切。这样刷新和前进后退都能回到原来那一页，
+// 也不用为了四个菜单项多开四个 HTML。
+const PANELS = ["users", "keys", "types", "checkin"];
 
 function currentPanel() {
   const name = window.location.hash.replace(/^#/, "");
@@ -91,6 +98,7 @@ function fillForm(key) {
   document.querySelector("#keyId").value = key ? key.id : "";
   document.querySelector("#keyName").value = key ? key.name : "";
   document.querySelector("#keyProtocol").value = key ? key.protocol : "gpt";
+  document.querySelector("#keyModelType").value = key ? key.modelType || "gpt" : "gpt";
   document.querySelector("#keyBase").value = key ? key.baseUrl : "https://uuapi.io/v1";
   document.querySelector("#keySecret").value = "";
   document.querySelector("#keyAgent").value = key ? key.userAgent || "" : "";
@@ -115,7 +123,7 @@ function render() {
   keyRows.replaceChildren();
   if (!state.keys.length) {
     const row = document.createElement("tr");
-    row.innerHTML = "<td colspan='5'>还没有 Key。</td>";
+    row.innerHTML = "<td colspan='6'>还没有 Key。</td>";
     keyRows.append(row);
   }
   state.keys.forEach((key) => {
@@ -127,6 +135,15 @@ function render() {
     sub.textContent = key.userAgent ? `UA: ${key.userAgent}` : "UA: 默认";
     name.append(sub);
     name.append(modelLine(key));
+    const modelType = document.createElement("td");
+    modelType.textContent = TYPE_LABEL[key.modelType] || "没设";
+    if (!TYPE_LABEL[key.modelType]) {
+      // 没设类型的 Key 挑不出来，用户选哪个类型都用不上它。
+      const warn = document.createElement("div");
+      warn.className = "bad-text";
+      warn.textContent = "用户端挑不到这把，编辑一下补上类型";
+      modelType.append(warn);
+    }
     const kind = document.createElement("td");
     kind.textContent = PROTOCOL_LABEL[key.protocol] || key.protocol;
     const money = document.createElement("td");
@@ -175,9 +192,11 @@ function render() {
     remove.textContent = "删除";
     remove.addEventListener("click", () => removeKey(key));
     actions.append(edit, refresh, models, remove);
-    row.append(name, kind, money, enabled, actions);
+    row.append(name, modelType, kind, money, enabled, actions);
     keyRows.append(row);
   });
+
+  renderTypes();
 
   userRows.replaceChildren();
   if (!state.users.length) {
@@ -237,6 +256,115 @@ async function loadState() {
   loginView.classList.add("hidden");
   appView.classList.remove("hidden");
   render();
+}
+
+// 生图类型那一页。默认模型给一串候选，用的是这个类型下面各把 Key 拉到的模型并集——
+// 配一个这些 Key 根本没有的模型，用户要等到生图失败才知道。
+function renderTypes() {
+  const rows = document.querySelector("#typeRows");
+  if (!rows) return;
+  const types = state.modelTypes || [];
+  rows.replaceChildren();
+  if (!types.length) {
+    const row = document.createElement("tr");
+    row.innerHTML = "<td colspan='5'>没拿到类型设置，刷新看看。</td>";
+    rows.append(row);
+    return;
+  }
+
+  for (const item of types) {
+    const row = document.createElement("tr");
+
+    const name = document.createElement("td");
+    name.textContent = item.label || item.type;
+    const sub = document.createElement("div");
+    sub.className = "sub";
+    const cost = Math.ceil(state.settings.generateCost * item.multiplier);
+    sub.textContent = `每次生图扣 ${cost} 额度`;
+    name.append(sub);
+
+    const choices = new Map();
+    let keys = 0;
+    let usable = 0;
+    for (const key of state.keys) {
+      if (key.modelType !== item.type) continue;
+      keys++;
+      if (key.enabled && key.balanceValid !== false) usable++;
+      for (const model of key.models || []) {
+        if (!choices.has(model.id)) choices.set(model.id, model.name || model.id);
+      }
+    }
+
+    const modelCell = document.createElement("td");
+    const input = document.createElement("input");
+    input.value = item.defaultModel || "";
+    input.placeholder = "例如 gpt-image-2.5";
+    input.spellcheck = false;
+    const listID = `modelChoices-${item.type}`;
+    input.setAttribute("list", listID);
+    const list = document.createElement("datalist");
+    list.id = listID;
+    for (const [id, label] of choices) {
+      const option = document.createElement("option");
+      option.value = id;
+      option.label = label;
+      list.append(option);
+    }
+    modelCell.append(input, list);
+    if (keys && choices.size && item.defaultModel && !choices.has(item.defaultModel)) {
+      const warn = document.createElement("div");
+      warn.className = "bad-text";
+      warn.textContent = "这个类型下面的 Key 都没拉到这个模型";
+      modelCell.append(warn);
+    }
+
+    const rateCell = document.createElement("td");
+    const rate = document.createElement("input");
+    rate.type = "number";
+    rate.min = "0.1";
+    rate.max = "100";
+    rate.step = "0.1";
+    rate.value = String(item.multiplier);
+    rateCell.append(rate);
+
+    const count = document.createElement("td");
+    count.textContent = keys ? `${keys} 把 · ${usable} 把可用` : "没挂 Key";
+
+    const actions = document.createElement("td");
+    actions.className = "row-actions";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "small";
+    save.textContent = "保存";
+    save.addEventListener("click", () => saveType(item, input, rate, save));
+    actions.append(save);
+
+    row.append(name, modelCell, rateCell, count, actions);
+    rows.append(row);
+  }
+}
+
+async function saveType(item, modelInput, rateInput, button) {
+  const status = document.querySelector("#typeStatus");
+  const multiplier = Number(rateInput.value);
+  if (!Number.isFinite(multiplier) || multiplier < 0.1 || multiplier > 100) {
+    setStatus(status, "倍率请填 0.1 到 100 之间", true);
+    return;
+  }
+  button.disabled = true;
+  setStatus(status, "正在保存…");
+  try {
+    await api(`/api/admin/types/${encodeURIComponent(item.type)}`, {
+      method: "PUT",
+      body: JSON.stringify({ defaultModel: modelInput.value.trim(), multiplier }),
+    });
+    await loadState();
+    setStatus(status, `${item.label} 已保存。`);
+  } catch (error) {
+    setStatus(status, error.message, true);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function refreshBalance(id, button) {
@@ -424,6 +552,7 @@ document.querySelector("#keyForm").addEventListener("submit", async (event) => {
     id: document.querySelector("#keyId").value,
     name: document.querySelector("#keyName").value,
     protocol: document.querySelector("#keyProtocol").value,
+    modelType: document.querySelector("#keyModelType").value,
     baseUrl: document.querySelector("#keyBase").value,
     apiKey: document.querySelector("#keySecret").value,
     userAgent: document.querySelector("#keyAgent").value,

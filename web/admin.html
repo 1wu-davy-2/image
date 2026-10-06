@@ -60,6 +60,7 @@
             <nav class="sidebar-nav" id="adminNav">
               <a class="sidebar-link" href="#users" data-panel="users"><span>用户管理</span></a>
               <a class="sidebar-link" href="#keys" data-panel="keys"><span>API 管理</span></a>
+              <a class="sidebar-link" href="#types" data-panel="types"><span>生图类型</span></a>
               <a class="sidebar-link" href="#checkin" data-panel="checkin"><span>签到</span></a>
             </nav>
 
@@ -105,7 +106,7 @@
               <div class="page-head">
                 <p class="eyebrow">管理</p>
                 <h2>API 管理</h2>
-                <p>按调用方式分组维护中转站的 Key 与余额。生图时优先挑余额多的、最近没怎么用过的。</p>
+                <p>维护中转站的 Key 与余额。生图时优先挑余额多的、最近没怎么用过的。</p>
               </div>
               <div class="card">
                 <h3>生图 Key</h3>
@@ -117,15 +118,22 @@
                     <input id="keyName" maxlength="40" required placeholder="例如：官方直连 1" />
                   </div>
                   <div>
-                    <label for="keyProtocol">类型</label>
-                    <select id="keyProtocol">
-                      <option value="gpt">GPT 生图</option>
-                      <option value="nano">Nano Banana 香蕉生图</option>
-                      <option value="gemini-official">GEMINI官方直连-带生图</option>
-                      <option value="gemini-batch">Gemini 批量生图</option>
+                    <label for="keyModelType">生图类型</label>
+                    <select id="keyModelType">
+                      <option value="gpt">GPT</option>
+                      <option value="gemini">GEMINI</option>
+                      <option value="grok">GROK</option>
                     </select>
                   </div>
                 </div>
+                <label for="keyProtocol">调用方式</label>
+                <select id="keyProtocol">
+                  <option value="gpt">GPT 生图</option>
+                  <option value="nano">Nano Banana 香蕉生图</option>
+                  <option value="gemini-official">GEMINI官方直连-带生图</option>
+                  <option value="gemini-batch">Gemini 批量生图</option>
+                </select>
+                <p class="hint">生图类型是给用户挑的那一项；调用方式决定请求怎么发。同一类型的 Key 可以有不同的调用方式。</p>
                 <label for="keyBase">中转地址</label>
                 <input id="keyBase" type="url" required spellcheck="false" value="https://uuapi.io/v1" />
                 <div class="row-actions tight">
@@ -165,7 +173,8 @@
                   <thead>
                     <tr>
                       <th>名称</th>
-                      <th>类型</th>
+                      <th>生图类型</th>
+                      <th>调用方式</th>
                       <th>剩余余额</th>
                       <th>状态</th>
                       <th>操作</th>
@@ -174,6 +183,35 @@
                   <tbody id="keyRows"></tbody>
                 </table>
               </div>
+              </div>
+            </section>
+
+            <section class="admin-panel hidden" data-panel="types">
+              <div class="page-head">
+                <p class="eyebrow">管理</p>
+                <h2>生图类型</h2>
+                <p>用户端只挑这三个类型，不挑具体模型。每个类型配一个默认模型和一个倍率，
+                  费用 = 每次生图消耗 × 倍率（向上取整）。</p>
+              </div>
+              <div class="card">
+                <h3>类型与倍率</h3>
+                <p class="hint">默认模型填错了（比如这个类型下面的 Key 根本没有这个模型），
+                  下面会标出来，用户端也会提示。</p>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>类型</th>
+                        <th>默认模型</th>
+                        <th>倍率</th>
+                        <th>Key</th>
+                        <th>操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="typeRows"></tbody>
+                  </table>
+                </div>
+                <p id="typeStatus" class="status" role="status"></p>
               </div>
             </section>
 

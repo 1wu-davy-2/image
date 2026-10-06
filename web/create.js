@@ -7,33 +7,12 @@
 const api = window.Darkroom.api;
 const prefsKey = "darkroom.prefs";
 
-const MODELS = {
-  gpt: [
-    ["gpt-image-2.5-flare", "gpt-image-2.5-flare"],
-    ["gpt-image-2.5", "gpt-image-2.5"],
-    ["gpt-image-1", "gpt-image-1"],
-  ],
-  nano: [
-    ["gemini-2.5-flash-image", "Nano Banana · gemini-2.5-flash-image"],
-    ["gemini-3-pro-image", "Nano Banana Pro · gemini-3-pro-image"],
-    ["gemini-3.1-flash-image", "gemini-3.1-flash-image"],
-  ],
-  "gemini-official": [
-    ["gemini-2.5-flash-image", "gemini-2.5-flash-image"],
-    ["gemini-3-pro-image", "gemini-3-pro-image"],
-    ["gemini-3.1-flash-image", "gemini-3.1-flash-image"],
-  ],
-};
-
-const HINTS = {
-  gpt: "使用管理端里的 GPT Key。接口是 /v1/images/generations。",
-  nano: "使用 Nano Banana 的 Key。生图接口不收这个模型时，会改走对话生图。",
-  "gemini-official": "使用「GEMINI官方直连-带生图」的 Key，走 Gemini 官方 generateContent。",
-};
-
-// 管理端「拉取模型」问来的、各调用方式下中转站实际支持的模型。
-// 拉不到就退回上面那份内置的，页面照样能用。
-let relayModels = null;
+// 生图类型：用户只挑这个，不挑模型——模型走管理端给每个类型配的默认模型。
+// 类型下面的 Key 用什么调用方式发请求，由服务端挑中的那把 Key 决定。
+//
+// 拉不到类型列表时留个空壳，页面照样能开，只是选不了。
+let generationTypes = [];
+let typeSynced = false;
 
 const CHANNEL_LABEL = { async: "异步", sync: "同步", chat: "对话生图", gemini: "官方格式" };
 
@@ -44,10 +23,8 @@ const TIER_LONG_SIDE = { "1K": 1024, "2K": 2048, "4K": 4096 };
 const GPT_RATIOS = { "1:1": [1, 1], "4:3": [4, 3], "3:4": [3, 4], "16:9": [16, 9] };
 
 const form = document.querySelector("#form");
-const protocol = document.querySelector("#protocol");
-const protocolHint = document.querySelector("#protocolHint");
-const model = document.querySelector("#model");
-const customModel = document.querySelector("#customModel");
+const modelType = document.querySelector("#modelType");
+const typeHint = document.querySelector("#typeHint");
 const prompt = document.querySelector("#prompt");
 const gptRatio = document.querySelector("#gptRatio");
 const gptResolution = document.querySelector("#gptResolution");
@@ -108,9 +85,8 @@ for (const tab of tabs) {
 function loadPrefs() {
   try {
     const saved = JSON.parse(localStorage.getItem(prefsKey) || "{}");
-    if (saved.protocol) protocol.value = saved.protocol;
-    if (saved.model) model.dataset.prefer = saved.model;
-    if (saved.customModel) customModel.value = saved.customModel;
+    // 类型要等 /api/types 回来才知道有哪些，先记着，fillTypes 里再挑。
+    if (saved.type) modelType.dataset.prefer = saved.type;
     if (saved.quality) quality.value = saved.quality;
     if (saved.gptRatio) gptRatio.value = saved.gptRatio;
     if (saved.gptResolution) gptResolution.value = saved.gptResolution;
@@ -129,9 +105,7 @@ function loadPrefs() {
 
 function savePrefs() {
   localStorage.setItem(prefsKey, JSON.stringify({
-    protocol: protocol.value,
-    model: model.value,
-    customModel: customModel.value.trim(),
+    type: modelType.value,
     quality: quality.value,
     gptRatio: gptRatio.value,
     gptResolution: gptResolution.value,
@@ -143,66 +117,76 @@ function savePrefs() {
   }));
 }
 
-// 当前调用方式下该显示哪些模型。中转站拉到了就用它，没有就用内置的那份。
-function modelSource() {
-  const relayed = relayModels ? relayModels[protocol.value] : null;
-  if (relayed && relayed.length) return { list: relayed, synced: true };
-  return {
-    list: (MODELS[protocol.value] || MODELS.gpt).map(([id, name]) => ({ id, name, available: true })),
-    synced: false,
-  };
+function currentType() {
+  return generationTypes.find((item) => item.type === modelType.value) || null;
 }
 
-function fillModels() {
-  const { list, synced } = modelSource();
-  const prefer = model.dataset.prefer || "";
-  // 拉取过就按实际情况来：不可用的禁掉，选不了就不会白跑一次。
-  const selectable = (item) => item.available || !synced;
-  const fallback = list.find(selectable) || list[0];
-
-  model.replaceChildren();
-  for (const item of list) {
+function fillTypes() {
+  const prefer = modelType.dataset.prefer || "";
+  modelType.replaceChildren();
+  for (const item of generationTypes) {
     const option = document.createElement("option");
-    option.value = item.id;
-    option.textContent = item.available ? item.name : `${item.name}（没有可用 Key）`;
-    if (!selectable(item)) option.disabled = true;
-    model.append(option);
+    option.value = item.type;
+    option.textContent = item.usable ? item.label : `${item.label}（没有可用 Key）`;
+    if (!item.usable) option.disabled = true;
+    modelType.append(option);
   }
-  const custom = document.createElement("option");
-  custom.value = "custom";
-  custom.textContent = "自定义";
-  model.append(custom);
+  if (!generationTypes.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "管理端还没挂 Key";
+    option.disabled = true;
+    modelType.append(option);
+  }
+  const known = generationTypes.find((item) => item.type === prefer && item.usable);
+  const fallback = generationTypes.find((item) => item.usable) || generationTypes[0];
+  if (known) modelType.value = known.type;
+  else if (fallback) modelType.value = fallback.type;
+  delete modelType.dataset.prefer;
 
-  const known = list.find((item) => item.id === prefer && selectable(item));
-  model.value = known ? prefer : prefer === "custom" ? "custom" : fallback.id;
-  if (model.value === "custom" && prefer && prefer !== "custom") customModel.value = customModel.value || prefer;
-  delete model.dataset.prefer;
-
-  protocolHint.textContent = modelHint(synced, list);
+  typeHint.textContent = typeLine();
 }
 
-function modelHint(synced, list) {
-  const base = HINTS[protocol.value] || "";
-  if (!synced) return `${base} 模型列表是内置的，去管理端点「拉取模型」可以换成中转站实际支持的那些。`;
-  const usable = list.filter((item) => item.available).length;
-  if (!usable) return `${base} 中转站报了 ${list.length} 个模型，但没有一把 Key 现在可用，先去管理端看看 Key 的余额和状态。`;
-  return `${base} 模型列表来自中转站，${usable} 个可用。`;
+// 用户不挑模型，所以这里要把他实际会用到的模型写出来——出问题描述得清楚。
+function typeLine() {
+  const item = currentType();
+  if (!item) return "管理端还没配置生图类型，先去「API 管理」挂一把 Key。";
+  const cost = Math.ceil((window.Darkroom.cost || 1) * item.multiplier);
+  const money = item.multiplier === 1 ? `每次消耗 ${cost} 额度` : `每次消耗 ${cost} 额度（${item.multiplier} 倍）`;
+  if (!item.usable) return `${money}。这个类型下面没有可用的 Key，先去管理端看看余额和状态。`;
+  const model = item.defaultModel ? `模型 ${item.defaultModel}` : "管理端还没给这个类型配默认模型";
+  if (item.defaultModel && !item.modelKnown) {
+    return `${money}。${model}——这个类型的 Key 还没拉到这个模型，生图可能会失败。`;
+  }
+  return `${money}。${model}。`;
 }
 
-async function loadModels() {
+async function loadTypes() {
   try {
-    const response = await fetch(api("/api/models"), { credentials: "include" });
+    const response = await fetch(api("/api/types"), { credentials: "include" });
     const data = await response.json().catch(() => ({}));
-    if (data.ok && data.models) relayModels = data.models;
+    if (data.ok && data.types) {
+      generationTypes = data.types;
+      typeSynced = true;
+    }
   } catch {
-    // 拉不到就用内置的，不打扰创作。
+    // 拉不到就空着，页面照开，只是选不了。
   }
+}
+
+// 尺寸控件按类型分两套：GEMINI 走官方格式，收的是画幅 + 档位；
+// GPT / GROK 走 images 接口，收的是具体像素 + 质量。
+//
+// 类型不直接决定调用方式（那是 Key 的事），所以这里只是「这个类型通常是哪套」。
+// 表单两套字段都会发出去，服务端按挑中的 Key 取用得上的那套——万一管理端
+// 给这个类型挂了别的调用方式的 Key，也不会因为少发了字段而失败。
+function isGeminiType() {
+  return modelType.value === "gemini";
 }
 
 function syncFields() {
-  const gemini = protocol.value !== "gpt";
+  const gemini = isGeminiType();
   const custom = gptResolution.value === "custom";
-  customModel.classList.toggle("hidden", model.value !== "custom");
   customSize.classList.toggle("hidden", gemini || !custom);
   pixelSize.classList.toggle("hidden", gemini);
   geminiSize.classList.toggle("hidden", !gemini);
@@ -212,11 +196,7 @@ function syncFields() {
   pixelHint.textContent = gemini ? ""
     : custom ? "单边不超过 8192 像素，总像素不超过 64Mi。"
       : `发出 size = ${selectedSize()}。`;
-  // 协议提示归 fillModels 管——它才知道模型是从中转站拉的还是内置的。
-}
-
-function selectedModel() {
-  return model.value === "custom" ? customModel.value.trim() : model.value;
+  // 类型那行提示归 fillTypes 管——它才知道模型是从管理端配来的。
 }
 
 function selectedSize() {
@@ -294,9 +274,9 @@ async function onSubmit(event) {
   if (submit.disabled) return;
   savePrefs();
 
-  const chosenModel = selectedModel();
-  if (!chosenModel) {
-    setStatus("请填写模型名。", true);
+  const item = currentType();
+  if (!item) {
+    setStatus("管理端还没配置生图类型。", true);
     return;
   }
   const text = prompt.value.trim();
@@ -305,17 +285,20 @@ async function onSubmit(event) {
     return;
   }
   const mode = form.querySelector('input[name="mode"]:checked').value;
-  const payload = { protocol: protocol.value, model: chosenModel, prompt: text, mode };
-  let sizeLabel = "";
-  if (protocol.value === "gpt") {
-    payload.size = selectedSize();
-    payload.quality = quality.value;
-    sizeLabel = `${payload.size} · ${payload.quality}`;
-  } else {
-    payload.aspectRatio = aspectRatio.value;
-    payload.imageSize = imageSize.value;
-    sizeLabel = `${payload.aspectRatio} · ${payload.imageSize}`;
-  }
+  // 两套尺寸字段都发：调用方式是服务端挑完 Key 才知道的，那边取用得上的那套。
+  const payload = {
+    type: item.type,
+    prompt: text,
+    mode,
+    size: selectedSize(),
+    quality: quality.value,
+    aspectRatio: aspectRatio.value,
+    imageSize: imageSize.value,
+  };
+  const gemini = isGeminiType();
+  const sizeLabel = gemini
+    ? `${payload.aspectRatio} · ${payload.imageSize}`
+    : `${payload.size} · ${payload.quality}`;
 
   submit.disabled = true;
   const started = Date.now();
@@ -342,7 +325,7 @@ async function onSubmit(event) {
     if (!response.ok || !data.ok) throw new Error(data.error || `请求失败（${response.status}）`);
     showResult({
       prompt: text,
-      model: chosenModel,
+      model: item.defaultModel,
       sizeLabel,
       channel: data.channel,
       taskId: data.taskId || "",
@@ -361,8 +344,8 @@ async function onSubmit(event) {
 }
 
 form.addEventListener("change", (event) => {
-  // 换调用方式要重新填模型下拉，不然还停在上一种方式的模型上。
-  if (event.target === protocol) fillModels();
+  // 换类型要换一套尺寸控件，顺手把那行提示也刷新。
+  if (event.target === modelType) fillTypes();
   syncFields();
   savePrefs();
 });
@@ -522,12 +505,17 @@ batchSubmit.addEventListener("click", submitBatch);
 batchRefresh.addEventListener("click", () => loadBatches());
 
 loadPrefs();
-// 先用内置列表渲染一次，页面立刻能用；中转站那份拉回来之后再刷一遍。
-fillModels();
+// 类型是管理端配的，得等 /api/types 回来才知道。先按空的重画一次占位，
+// 拿到之后 fillTypes 会挑回上次用的那个类型。
+fillTypes();
 syncFields();
 showTab("draw");
-loadModels().then(() => {
-  fillModels();
+// 费用提示要用 generateCost，登录态回来才知道。
+window.Darkroom.ready.then((session) => {
+  if (session) window.Darkroom.cost = session.generateCost || 1;
+  return loadTypes();
+}).then(() => {
+  fillTypes();
   syncFields();
 });
 

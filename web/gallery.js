@@ -30,6 +30,51 @@ function actionButton(label, handler, extra = "") {
   return button;
 }
 
+// navigator.clipboard 只在安全上下文里有。用 127.0.0.1 / localhost 打开算安全上下文，
+// 换成局域网 IP（192.168.x.x）就不是了——那种时候退回老办法，别让按钮点了没反应。
+async function copyText(text) {
+  if (window.isSecureContext && navigator.clipboard) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // 落到下面的兜底
+    }
+  }
+  const scratch = document.createElement("textarea");
+  scratch.value = text;
+  scratch.setAttribute("readonly", "");
+  scratch.style.cssText = "position:fixed;top:-1000px;left:0;opacity:0";
+  document.body.append(scratch);
+  scratch.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  scratch.remove();
+  return ok;
+}
+
+// 复制完把按钮本身改成「已复制」：反馈就在刚点的地方，不用去页面底下找那行状态。
+function copyPromptButton(prompt) {
+  const button = actionButton("复制提示词", async () => {
+    if (!(await copyText(prompt))) {
+      setStatus("复制失败——浏览器不让写剪贴板，手动选中提示词复制吧。", true);
+      return;
+    }
+    setStatus("");
+    button.textContent = "已复制";
+    button.disabled = true;
+    window.setTimeout(() => {
+      button.textContent = "复制提示词";
+      button.disabled = false;
+    }, 1500);
+  });
+  return button;
+}
+
 function workCard(item) {
   const card = document.createElement("article");
   card.className = "work-card";
@@ -76,17 +121,22 @@ function workCard(item) {
 
   const actions = document.createElement("div");
   actions.className = "work-actions";
-  if (!isWorks) {
+  if (isWorks) {
+    // 这页上多半是别人的图。看到喜欢的想照着自己的意思再画一张，
+    // 得先能把提示词抄走，所以复制按钮对谁都给。
+    actions.append(copyPromptButton(item.prompt));
+    if (item.mine) {
+      const link = document.createElement("a");
+      link.className = "btn small";
+      link.href = "./gallery";
+      link.textContent = "去作品集管理";
+      actions.append(link);
+    }
+  } else {
     actions.append(
       actionButton(item.isPublic ? "取消公开" : "设为公开", () => togglePublic(item)),
       actionButton("删除", () => removeWork(item), "danger"),
     );
-  } else if (item.mine) {
-    const link = document.createElement("a");
-    link.className = "btn small";
-    link.href = "./gallery";
-    link.textContent = "去作品集管理";
-    actions.append(link);
   }
   if (actions.childElementCount) body.append(actions);
 

@@ -31,22 +31,35 @@ function make(tag, className, text) {
   return node;
 }
 
+// 同一组菜单项在侧栏和顶栏各渲染一份，两边都靠 body 上的 data-nav 决定高亮哪一项。
+function navLinks(className) {
+  const current = document.body.dataset.nav || "";
+  return NAV.map((item) => {
+    const link = make("a", className);
+    link.href = item.href;
+    link.append(make("span", "", item.label));
+    if (item.key === current) link.setAttribute("aria-current", "page");
+    return link;
+  });
+}
+
+// 顶栏中间那份菜单，是侧栏那份的副本。窄屏由 CSS 隐藏——那会儿侧栏自己
+// 已经横过来变成一条导航了，顶栏再放一份是重复的。
+function renderTopNav() {
+  const box = document.querySelector("#topNav");
+  if (!box) return;
+  box.replaceChildren(...navLinks(""));
+}
+
 function renderSidebar() {
   const box = document.querySelector("#sidebar");
   if (!box) return;
-  const current = document.body.dataset.nav || "";
 
   box.replaceChildren();
   box.append(make("p", "eyebrow sidebar-title", "画坊"));
 
   const nav = make("nav", "sidebar-nav");
-  for (const item of NAV) {
-    const link = make("a", "sidebar-link");
-    link.href = item.href;
-    link.append(make("span", "", item.label));
-    if (item.key === current) link.setAttribute("aria-current", "page");
-    nav.append(link);
-  }
+  nav.append(...navLinks("sidebar-link"));
   box.append(nav);
 
   const quota = make("div", "sidebar-quota");
@@ -118,11 +131,57 @@ function renderUserMenu() {
   });
 
   box.append(button, panel);
+
+  // 上面那句 replaceChildren 把顶栏那两个数一起抹掉了——#userMenu 就是 .top-trailing
+  // 本身，不是它的子节点。在这儿补回来，别指望调用方记得按顺序调。
+  renderTopStats();
+}
+
+// 认识的货币给符号，不认识的（有的站用积分）原样带单位显示。
+const CURRENCY_SIGNS = { USD: "$", CNY: "¥", RMB: "¥" };
+
+function moneyText(total, unit) {
+  const name = String(unit || "USD").toUpperCase();
+  // 浮点相加会拖出 0.30000000000000004 这种尾巴，先收到中转站自己用的精度。
+  const value = Math.round(total * 10000) / 10000;
+  const sign = CURRENCY_SIGNS[name];
+  return sign ? `${sign}${value.toFixed(2)}` : `${value} ${name}`;
+}
+
+// 顶栏右上角那两个数。额度谁都有；中转站余额后端给非管理员的是模糊过的
+// （blurred），只有管理员拿到真账。
+function renderTopStats() {
+  const box = document.querySelector(".top-trailing");
+  if (!box || !session || !session.user) return;
+
+  let node = box.querySelector("#topStats");
+  if (!node) {
+    node = make("p", "top-stats");
+    node.id = "topStats";
+    box.prepend(node);
+  }
+  node.replaceChildren();
+  node.append(make("span", "", `额度 ${session.user.quota}`));
+
+  const balance = session.relayBalance;
+  if (balance) {
+    node.append(make("span", "top-stats-dot", "·"));
+    // 模糊过的那份后面缀个「充足」，说明这是个够不够用的说法，不是精确数。
+    const suffix = balance.blurred ? "（充足）" : "";
+    const money = make("span", "top-stats-balance",
+      `余额 ${moneyText(balance.total, balance.unit)}${suffix}`);
+    if (session.user.isAdmin) {
+      money.title = `${balance.keys} 把 Key 的余额合计，在管理端刷新余额后更新`;
+    }
+    node.append(money);
+  }
 }
 
 function setQuota(value) {
+  if (session && session.user) session.user.quota = value;
   const node = document.querySelector("#sidebarQuota .sidebar-quota-number");
   if (node) node.textContent = String(value);
+  renderTopStats();
 }
 
 async function refreshMe() {
@@ -159,6 +218,8 @@ function imageURL(generation, position) {
 
 window.Darkroom = { api, ready, refreshMe, setQuota, formatDate, imageURL };
 
+// 顶栏那份不依赖登录态，先画出来，别等 /api/me 回来才出现。
+renderTopNav();
 renderSidebar();
 
 })();

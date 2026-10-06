@@ -105,6 +105,23 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
   color: var(--ink-muted);
 }
 
+/* 顶栏右上角的两个数。余额用青色——它和用户自己的额度不是一回事，
+   颜色分开省得看串。 */
+.top-stats {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.top-stats-dot { opacity: 0.5; }
+.top-stats-balance { color: var(--cyan-deep); }
+
+/* 顶栏中间那份菜单，是侧栏那份的副本。用 .nav 那套样式，只是压到 40px 高，
+   跟右边的用户菜单齐平——不然整条顶栏会被这 4px 撑高。 */
+.top-nav a { height: 40px; }
+
 /* 云纹分隔：和参考站同一条曲线 */
 .motif { overflow: hidden; padding: 0 16px; color: var(--cyan); }
 .motif svg { display: block; width: 100%; height: 26px; }
@@ -790,9 +807,12 @@ body.studio-page .shell { position: relative; z-index: 1; }
 
 /* ---------- 作品网格（作品集 / 公开作品） ---------- */
 
+/* 列数是 auto-fill 算出来的，而 1fr 会让每列撑满——所以想放大单张卡片，
+   唯一的办法是把下限抬高、让每行少放一张。260 在常见的 1040 内容宽下是 3 列，
+   单张从 ~248 涨到 ~336。 */
 .work-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 16px;
   margin-top: 20px;
 }
@@ -931,6 +951,10 @@ body.admin-page { display: flex; flex-direction: column; min-height: 100dvh; }
 @media (max-width: 900px) {
   .layout { grid-template-columns: 1fr; }
   .top-inner { flex-wrap: wrap; }
+  /* 顶栏那份菜单让位：这时候侧栏自己已经横过来变成一条导航了，两份是重复的。 */
+  .top-nav { display: none; }
+  /* 窄屏放不下就整块折到第二行，别把用户菜单挤出屏幕。 */
+  .top-trailing { flex-wrap: wrap; justify-content: flex-end; }
   .page-head h2 { font-size: 25px; }
   .canvas { min-height: 260px; }
 }
